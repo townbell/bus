@@ -6,7 +6,7 @@ This directory contains comprehensive examples demonstrating the features and ca
 
 ## Requirements
 
-- Go 1.19 or higher
+- Go 1.21 or higher
 - All examples use `//go:build ignore` to prevent conflicts when running `go test ./...`
 - Examples must be run individually using `go run filename.go`
 

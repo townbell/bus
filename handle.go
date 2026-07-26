@@ -18,8 +18,16 @@ type Handle[T any] struct {
 	mu       sync.Mutex
 }
 
-// Unsubscribe removes this specific subscription
+// Unsubscribe removes this specific subscription.
+//
+// A nil handle is reported as an error rather than a panic. Subscribe helpers
+// that return only a handle yield nil when the subscription is rejected (nil
+// callback, or a closed bus), so a deferred Unsubscribe must stay safe.
 func (h *Handle[T]) Unsubscribe() error {
+	if h == nil {
+		return fmt.Errorf("handle is nil: the subscription was never created")
+	}
+
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
@@ -38,8 +46,13 @@ func (h *Handle[T]) Unsubscribe() error {
 	return nil
 }
 
-// IsActive returns whether this handle is still active
+// IsActive returns whether this handle is still active. A nil handle is never
+// active.
 func (h *Handle[T]) IsActive() bool {
+	if h == nil {
+		return false
+	}
+
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.handler != nil

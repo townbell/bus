@@ -7,11 +7,12 @@
 </p>
 
 
-[![Go Version](https://img.shields.io/badge/go-%3E%3D1.19-blue.svg)](https://golang.org/)
+[![CI](https://github.com/townbell/bus/actions/workflows/ci.yml/badge.svg)](https://github.com/townbell/bus/actions/workflows/ci.yml)
+[![Go Version](https://img.shields.io/badge/go-%3E%3D1.21-blue.svg)](https://golang.org/)
 [![Go Reference](https://pkg.go.dev/badge/github.com/townbell/bus.svg)](https://pkg.go.dev/github.com/townbell/bus)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Go Report Card](https://goreportcard.com/badge/github.com/townbell/bus)](https://goreportcard.com/report/github.com/townbell/bus)
-[![Coverage](https://img.shields.io/badge/coverage-91.2%25-brightgreen.svg)](https://github.com/townbell/bus)
+[![Coverage](https://img.shields.io/badge/coverage-93.3%25-brightgreen.svg)](https://github.com/townbell/bus/actions/workflows/ci.yml)
 
 
 
@@ -49,6 +50,14 @@ import "github.com/townbell/bus" // package bus
 
 ```bash
 go get github.com/townbell/bus
+```
+
+The core module has no dependencies at all — importing it pulls in nothing but
+the standard library. The optional Prometheus adapter lives in its own module,
+so `client_golang` only enters your build if you ask for it:
+
+```bash
+go get github.com/townbell/bus/prometheus
 ```
 
 ## 🚀 Quick Start
@@ -271,6 +280,7 @@ handle, err := eventBus.SubscribeWithOptions("payment.validate", func(event Paym
 - Middleware must call `next()` to continue to the next middleware and handlers; skipping `next()` intercepts the event.
 - `SubscribeOnce` / `SubscribeOnceAsync` handlers execute successfully at most once, including when multiple one-time handlers share a topic.
 - After `Close`, the bus rejects new publish and subscribe calls; already-started async handlers are allowed to finish.
+- Subscribe helpers that return only a `*Handle[T]` yield `nil` when the subscription is rejected (nil callback, or a closed bus). A `nil` handle is safe to use: `Unsubscribe` returns an error and `IsActive` returns `false`, so a deferred `Unsubscribe` never panics. Use `SubscribeWithOptions` when you want the rejection reason.
 
 ## 🗺️ RoadMap
 
@@ -283,6 +293,12 @@ Townbell will keep its focus on being an in-process, type-safe, lightweight even
 | P1 | Done | Documentation alignment | README content now documents the current P1 behavior and examples |
 | P1 | Done | Observability | Per-topic and per-handler published, processed, failed, and duration metrics are available, with an optional Prometheus adapter |
 | P1 | Done | Execution control | `SubscribeWithOptions` supports handler-level timeout, recover policy, async/serial execution, and max concurrency |
+| P1 | Done | Continuous integration | GitHub Actions runs build, vet, race tests, a gofmt gate and a coverage floor across a Go version matrix, and vets `example/` explicitly |
+| P1 | Done | Dependency-free core | The Prometheus adapter moved into its own module, so importing `bus` pulls in nothing but the standard library |
+| P1 | Done | Runnable documentation | Godoc `Example` functions execute in CI with verified output and render on pkg.go.dev |
+| P0 | Planned | Subscription API convergence | Three different shapes coexist today: `error` only, `*Handle[T]` only, and `(*Handle[T], error)`. Converge on the last one. Breaking, so it gates v1.0.0 |
+| P0 | Planned | Handler error reporting | Handlers are `func(T)` and cannot report a business failure except by panicking, so `ErrorHandler` only ever sees panics and timeouts. Breaking, gates v1.0.0, and unblocks result collection |
+| P0 | Planned | `Publish` error semantics | Decide whether `Publish` returns an error or whether discarding it becomes a permanent contract. Gates v1.0.0 |
 | P2 | Planned | Result collection | Borrow from Blinker and add a `PublishCollect`-style API for collecting handler results or errors |
 | P2 | Partial | Topic enhancements | Wildcard (`*`) topics are implemented; hierarchical topics and no-subscriber hooks are still planned |
 | P2 | Planned | Integration examples | Add practical examples for `net/http`, Gin, CLI apps, and workers |
@@ -453,23 +469,33 @@ eventBus.SubscribeWithFilter("user.activity", handler, func(topic string, event 
 
 ## 🧪 Testing
 
-Run the complete test suite:
+Run the complete test suite. The Prometheus adapter is a separate module, so it
+needs its own invocation:
 
 ```bash
-go test -v ./...
+go test -race ./...
+(cd prometheus && go test -race ./...)
 ```
 
-Generate test coverage report:
+Files under `example/` carry `//go:build ignore`, which means `go vet ./...`
+skips them. Vet them by name:
 
 ```bash
-go test -cover ./...
+for f in example/*.go; do go vet "$f"; done
+```
+
+Generate a coverage report:
+
+```bash
 go test -coverprofile=coverage.out ./...
 go tool cover -html=coverage.out -o coverage.html
 ```
 
-**Current test coverage: 91.2%** (whole module, `go test -coverprofile ./...`) - We maintain high test coverage to ensure reliability and stability.
+**Current coverage: 93.3%** for the core module, 79.7% for the Prometheus
+adapter. CI enforces a 90% floor on the core module, so this figure cannot
+silently drift.
 
-Run performance benchmarks:
+Run the benchmarks:
 
 ```bash
 go test -bench=. -benchmem
@@ -477,12 +503,32 @@ go test -bench=. -benchmem
 
 ## 📈 Performance
 
-Benchmark results on Go 1.19+:
+Measured on an Apple M5 (10 cores), Go 1.22.12, darwin/arm64, on 2026-07-26.
+Every benchmark uses `b.RunParallel`, so `ns/op` is the aggregate cost across
+all cores rather than single-goroutine latency.
 
-- **Sync Publishing**: ~2,000,000 events/sec
-- **Async Publishing**: ~5,000,000 events/sec
-- **Memory Usage**: Minimal GC pressure
-- **Concurrency**: Excellent multi-core scaling
+| Benchmark | ns/op | B/op | allocs/op |
+| --- | --- | --- | --- |
+| `SyncPublish` (1 subscriber) | 839 | 392 | 11 |
+| `AsyncPublish` (1 subscriber) | 1320 | 520 | 12 |
+| `MultipleSubscribers` | 4470 | 752 | 29 |
+| `WithPriority` | 532 | 472 | 15 |
+| `WithFilter` | 240 | 376 | 10 |
+| `ConcurrentSubscribeUnsubscribe` | 3613 | 1207 | 38 |
+| `ChannelBaseline` (raw Go channel) | 50 | 0 | 0 |
+
+Two things are worth reading off this table:
+
+- **Asynchronous publishing is slower than synchronous publishing**, not faster.
+  Every async dispatch starts a goroutine and touches a `WaitGroup` and a mutex.
+  Reach for async to keep a slow handler off the publishing goroutine, not to
+  raise throughput.
+- **A raw channel is roughly 17x cheaper.** The bus buys you fan-out,
+  priorities, filters, middleware and metrics. If all you need is to hand a
+  value to one known goroutine, a channel is the better tool.
+
+Numbers on your hardware will differ. Re-run the benchmarks rather than trusting
+this table.
 
 ## 🤝 Contributing
 

@@ -1,0 +1,120 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test (Go ${{ matrix.go }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ['1.21', '1.22', '1.23', 'stable']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          # The root module has no dependencies, so it has no go.sum.
+          cache-dependency-path: prometheus/go.sum
+
+      - name: Build
+        run: |
+          go build ./...
+          cd prometheus && go build ./...
+
+      - name: Vet
+        run: |
+          go vet ./...
+          cd prometheus && go vet ./...
+
+      - name: Build and vet examples
+        # Files under example/ carry //go:build ignore, so `go vet ./...` skips
+        # them entirely. They must be named explicitly, one at a time: each is a
+        # separate package main with its own func main.
+        run: |
+          for f in example/*.go; do
+            echo "==> $f"
+            go vet "$f"
+            go build -o /dev/null "$f"
+          done
+
+      - name: Test with race detector
+        run: |
+          go test -race ./...
+          cd prometheus && go test -race ./...
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache-dependency-path: prometheus/go.sum
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt-formatted:"
+            echo "$unformatted"
+            gofmt -d $unformatted
+            exit 1
+          fi
+
+      - name: go.mod is tidy
+        run: |
+          go mod tidy
+          (cd prometheus && go mod tidy)
+          if ! git diff --exit-code -- go.mod prometheus/go.mod prometheus/go.sum; then
+            echo "go.mod or go.sum is not tidy; run 'go mod tidy' in both modules"
+            exit 1
+          fi
+
+      - name: Root module has no dependencies
+        # The core library is dependency-free by design. The Prometheus adapter
+        # lives in its own module so importing bus never pulls client_golang in.
+        run: |
+          deps=$(go list -m all | tail -n +2)
+          if [ -n "$deps" ]; then
+            echo "The root module gained dependencies:"
+            echo "$deps"
+            exit 1
+          fi
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache-dependency-path: prometheus/go.sum
+
+      - name: Measure coverage
+        env:
+          MINIMUM: '90.0'
+        run: |
+          go test -coverprofile=coverage.out ./...
+          total=$(go tool cover -func=coverage.out | tail -1 | awk '{print $3}' | tr -d '%')
+          echo "Total coverage: ${total}% (floor: ${MINIMUM}%)"
+          echo "### Coverage: ${total}%" >> "$GITHUB_STEP_SUMMARY"
+          awk -v total="$total" -v min="$MINIMUM" \
+            'BEGIN { exit (total + 0 >= min + 0) ? 0 : 1 }' || {
+              echo "Coverage ${total}% is below the ${MINIMUM}% floor"
+              exit 1
+            }
