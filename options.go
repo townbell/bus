@@ -24,9 +24,13 @@ type handlerOptions struct {
 	timeout        time.Duration
 	recoverPolicy  RecoverPolicy
 	maxConcurrency int
+	// filter holds an EventFilter[T]. The option constructor is generic while
+	// HandlerOption is not, so the value is carried as any and re-typed by
+	// Subscribe, which reports a mismatch as an error.
+	filter any
 }
 
-// HandlerOption configures a subscription created with SubscribeWithOptions.
+// HandlerOption configures a subscription created with Subscribe.
 type HandlerOption func(*handlerOptions)
 
 // HandlerPriority sets the handler priority.
@@ -37,6 +41,7 @@ func HandlerPriority(priority Priority) HandlerOption {
 }
 
 // HandlerContext sets a context that can disable the handler when canceled.
+// Asynchronous handlers also receive this context while running.
 func HandlerContext(ctx context.Context) HandlerOption {
 	return func(opts *handlerOptions) {
 		opts.ctx = ctx
@@ -58,7 +63,20 @@ func HandlerOnce() HandlerOption {
 	}
 }
 
-// HandlerTimeout bounds how long PublishWithContext waits for this handler.
+// HandlerFilter runs the handler only for events accepted by the filter. The
+// filter's event type must match the bus event type; Subscribe reports a
+// mismatch as an error.
+func HandlerFilter[T any](filter EventFilter[T]) HandlerOption {
+	return func(opts *handlerOptions) {
+		if filter == nil {
+			return
+		}
+		opts.filter = filter
+	}
+}
+
+// HandlerTimeout bounds how long a publish call waits for this handler. The
+// handler's context is canceled when the timeout elapses.
 func HandlerTimeout(timeout time.Duration) HandlerOption {
 	return func(opts *handlerOptions) {
 		opts.timeout = timeout

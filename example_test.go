@@ -2,6 +2,7 @@ package bus_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -20,9 +21,14 @@ func Example() {
 	b := bus.NewTyped[UserEvent]()
 	defer b.Close()
 
-	handle := b.SubscribeWithHandle("user.login", func(event UserEvent) {
+	handle, err := b.Subscribe("user.login", func(ctx context.Context, event UserEvent) error {
 		fmt.Printf("%s performed %s\n", event.UserID, event.Action)
+		return nil
 	})
+	if err != nil {
+		fmt.Println("subscribe failed:", err)
+		return
+	}
 	defer handle.Unsubscribe()
 
 	b.Publish("user.login", UserEvent{UserID: "u-1", Action: "login"})
@@ -33,19 +39,20 @@ func Example() {
 
 // Handlers run from the highest priority to the lowest. Handlers registered at
 // the same priority keep their registration order.
-func ExampleEventBus_SubscribeWithPriority() {
+func ExampleHandlerPriority() {
 	b := bus.NewTyped[string]()
 	defer b.Close()
 
-	b.SubscribeWithPriority("order.placed", func(string) {
-		fmt.Println("3. analytics")
-	}, bus.PriorityLow)
-	b.SubscribeWithPriority("order.placed", func(string) {
-		fmt.Println("1. fraud check")
-	}, bus.PriorityCritical)
-	b.SubscribeWithPriority("order.placed", func(string) {
-		fmt.Println("2. fulfilment")
-	}, bus.PriorityNormal)
+	say := func(line string) bus.Handler[string] {
+		return func(ctx context.Context, event string) error {
+			fmt.Println(line)
+			return nil
+		}
+	}
+
+	b.Subscribe("order.placed", say("3. analytics"), bus.HandlerPriority(bus.PriorityLow))
+	b.Subscribe("order.placed", say("1. fraud check"), bus.HandlerPriority(bus.PriorityCritical))
+	b.Subscribe("order.placed", say("2. fulfilment"), bus.HandlerPriority(bus.PriorityNormal))
 
 	b.Publish("order.placed", "o-1")
 
@@ -56,15 +63,16 @@ func ExampleEventBus_SubscribeWithPriority() {
 }
 
 // A filter decides per event whether its handler runs at all.
-func ExampleEventBus_SubscribeWithFilter() {
+func ExampleHandlerFilter() {
 	b := bus.NewTyped[UserEvent]()
 	defer b.Close()
 
-	b.SubscribeWithFilter("user.action", func(event UserEvent) {
+	b.Subscribe("user.action", func(ctx context.Context, event UserEvent) error {
 		fmt.Println("admin action:", event.Action)
-	}, func(topic string, event UserEvent) bool {
+		return nil
+	}, bus.HandlerFilter(func(topic string, event UserEvent) bool {
 		return strings.HasPrefix(event.UserID, "admin-")
-	})
+	}))
 
 	b.Publish("user.action", UserEvent{UserID: "u-1", Action: "read"})
 	b.Publish("user.action", UserEvent{UserID: "admin-1", Action: "delete"})
@@ -73,14 +81,17 @@ func ExampleEventBus_SubscribeWithFilter() {
 	// admin action: delete
 }
 
-// SubscribeWithOptions is the extensible subscription path. It is the only
-// helper that reports why a subscription was rejected.
-func ExampleEventBus_SubscribeWithOptions() {
+// Options compose: a single Subscribe call configures priority, timeout,
+// panic policy and concurrency.
+func ExampleEventBus_Subscribe() {
 	b := bus.NewTyped[string]()
 	defer b.Close()
 
-	handle, err := b.SubscribeWithOptions("payment.validate",
-		func(id string) { fmt.Println("validating", id) },
+	handle, err := b.Subscribe("payment.validate",
+		func(ctx context.Context, id string) error {
+			fmt.Println("validating", id)
+			return nil
+		},
 		bus.HandlerPriority(bus.PriorityHigh),
 		bus.HandlerTimeout(2*time.Second),
 		bus.HandlerRecoverPolicy(bus.RecoverAndStop),
@@ -98,6 +109,31 @@ func ExampleEventBus_SubscribeWithOptions() {
 	// validating p-1
 }
 
+// A handler error does not stop dispatch: later handlers still run, and the
+// publish call returns the joined failures of the synchronous handlers.
+func ExampleEventBus_Publish() {
+	b := bus.NewTyped[string]()
+	defer b.Close()
+	// The default logger reports handler failures on stdout; silence it here
+	// so the example output stays deterministic.
+	b.SetLogger(bus.NewNoOpLogger())
+
+	b.Subscribe("job.run", func(ctx context.Context, id string) error {
+		return errors.New("disk full")
+	}, bus.HandlerPriority(bus.PriorityHigh))
+	b.Subscribe("job.run", func(ctx context.Context, id string) error {
+		fmt.Println("second handler still runs")
+		return nil
+	})
+
+	err := b.Publish("job.run", "j-1")
+	fmt.Println("err:", err)
+
+	// Output:
+	// second handler still runs
+	// err: disk full
+}
+
 // Middleware wraps the whole dispatch. Calling next runs the remaining
 // middleware and then the handlers; not calling it intercepts the event.
 func ExampleEventBus_AddMiddleware() {
@@ -111,8 +147,9 @@ func ExampleEventBus_AddMiddleware() {
 		return nil
 	})
 
-	_ = b.Subscribe("job.run", func(id string) {
+	b.Subscribe("job.run", func(ctx context.Context, id string) error {
 		fmt.Println("handling", id)
+		return nil
 	})
 	b.Publish("job.run", "j-1")
 
@@ -128,11 +165,13 @@ func ExampleEventBus_Subscribe_wildcard() {
 	b := bus.NewTyped[string]()
 	defer b.Close()
 
-	_ = b.Subscribe("user.created", func(payload string) {
+	b.Subscribe("user.created", func(ctx context.Context, payload string) error {
 		fmt.Println("welcome:", payload)
+		return nil
 	})
-	_ = b.Subscribe("*", func(payload string) {
+	b.Subscribe("*", func(ctx context.Context, payload string) error {
 		fmt.Println("audit:", payload)
+		return nil
 	})
 
 	b.Publish("user.created", "u-1")
@@ -142,8 +181,8 @@ func ExampleEventBus_Subscribe_wildcard() {
 	// audit: u-1
 }
 
-// Publish discards errors. Use PublishWithContext when cancellation, timeout or
-// closed-bus errors matter.
+// Canceling the publish context aborts dispatch; a closed bus rejects the
+// publish outright.
 func ExampleEventBus_PublishWithContext() {
 	b := bus.NewTyped[string]()
 	b.Close()
@@ -159,7 +198,7 @@ func ExampleEventBus_GetMetrics() {
 	b := bus.NewTyped[string]()
 	defer b.Close()
 
-	_ = b.Subscribe("job.run", func(string) {})
+	b.Subscribe("job.run", func(ctx context.Context, id string) error { return nil })
 	b.Publish("job.run", "j-1")
 	b.Publish("job.run", "j-2")
 
@@ -170,14 +209,15 @@ func ExampleEventBus_GetMetrics() {
 	// 2 2 0 1
 }
 
-// Subscribe helpers that return only a handle yield nil when the subscription
-// is rejected. The returned handle stays safe to use, so a deferred
-// Unsubscribe never panics.
+// Ignoring the error from Subscribe leaves a nil handle. The nil handle stays
+// safe to use, so a deferred Unsubscribe never panics.
 func ExampleHandle_Unsubscribe_nilHandle() {
 	b := bus.NewTyped[string]()
 	b.Close()
 
-	handle := b.SubscribeWithHandle("user.created", func(string) {})
+	handle, _ := b.Subscribe("user.created", func(ctx context.Context, event string) error {
+		return nil
+	})
 	fmt.Println("active:", handle.IsActive())
 	fmt.Println("err:", handle.Unsubscribe())
 

@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"time"
@@ -81,7 +82,7 @@ func main() {
 
 func processOrderWorkflow(orderBus bus.Bus[Order], paymentBus bus.Bus[Payment], inventoryBus bus.Bus[Inventory]) {
 	// Order Service - handles order lifecycle
-	orderCreatedHandle := orderBus.SubscribeWithPriority("order.created", func(order Order) {
+	orderCreatedHandle, _ := orderBus.Subscribe("order.created", func(ctx context.Context, order Order) error {
 		fmt.Printf("📦 [ORDER-SERVICE] Order created: %s for user %s (%.2f)\n",
 			order.ID, order.UserID, order.Amount)
 
@@ -101,10 +102,11 @@ func processOrderWorkflow(orderBus bus.Bus[Order], paymentBus bus.Bus[Payment], 
 			Method:  "credit_card",
 			Status:  "pending",
 		})
-	}, bus.PriorityCritical)
+		return nil
+	}, bus.HandlerPriority(bus.PriorityCritical))
 
 	// Inventory Service - manages stock
-	inventoryReserveHandle := inventoryBus.SubscribeWithHandle("inventory.reserve", func(inv Inventory) {
+	inventoryReserveHandle, _ := inventoryBus.Subscribe("inventory.reserve", func(ctx context.Context, inv Inventory) error {
 		fmt.Printf("📦 [INVENTORY-SERVICE] Reserving %d units of product %s\n",
 			inv.Quantity, inv.ProductID)
 
@@ -112,15 +114,17 @@ func processOrderWorkflow(orderBus bus.Bus[Order], paymentBus bus.Bus[Payment], 
 		time.Sleep(50 * time.Millisecond)
 		fmt.Printf("✅ [INVENTORY-SERVICE] Reserved %d units of product %s\n",
 			inv.Quantity, inv.ProductID)
+		return nil
 	})
 
-	inventoryReleaseHandle := inventoryBus.SubscribeWithHandle("inventory.release", func(inv Inventory) {
+	inventoryReleaseHandle, _ := inventoryBus.Subscribe("inventory.release", func(ctx context.Context, inv Inventory) error {
 		fmt.Printf("🔄 [INVENTORY-SERVICE] Releasing %d units of product %s\n",
 			inv.Quantity, inv.ProductID)
+		return nil
 	})
 
 	// Payment Service - processes payments
-	paymentProcessHandle := paymentBus.SubscribeWithHandle("payment.process", func(payment Payment) {
+	paymentProcessHandle, _ := paymentBus.Subscribe("payment.process", func(ctx context.Context, payment Payment) error {
 		fmt.Printf("💳 [PAYMENT-SERVICE] Processing payment for order %s (%.2f)\n",
 			payment.OrderID, payment.Amount)
 
@@ -145,10 +149,11 @@ func processOrderWorkflow(orderBus bus.Bus[Order], paymentBus bus.Bus[Payment], 
 				Status:  "completed",
 			})
 		}
+		return nil
 	})
 
 	// Payment Success Handler
-	paymentSuccessHandle := paymentBus.SubscribeWithHandle("payment.succeeded", func(payment Payment) {
+	paymentSuccessHandle, _ := paymentBus.Subscribe("payment.succeeded", func(ctx context.Context, payment Payment) error {
 		fmt.Printf("✅ [PAYMENT-SERVICE] Payment succeeded for order %s\n", payment.OrderID)
 
 		// Update order status to confirmed
@@ -156,10 +161,11 @@ func processOrderWorkflow(orderBus bus.Bus[Order], paymentBus bus.Bus[Payment], 
 			ID:     payment.OrderID,
 			Status: "confirmed",
 		})
+		return nil
 	})
 
 	// Payment Failure Handler
-	paymentFailureHandle := paymentBus.SubscribeWithHandle("payment.failed", func(payment Payment) {
+	paymentFailureHandle, _ := paymentBus.Subscribe("payment.failed", func(ctx context.Context, payment Payment) error {
 		fmt.Printf("❌ [PAYMENT-SERVICE] Payment failed for order %s\n", payment.OrderID)
 
 		// Cancel order and release inventory
@@ -167,18 +173,20 @@ func processOrderWorkflow(orderBus bus.Bus[Order], paymentBus bus.Bus[Payment], 
 			ID:     payment.OrderID,
 			Status: "cancelled",
 		})
+		return nil
 	})
 
 	// Order Confirmed Handler
-	orderConfirmedHandle := orderBus.SubscribeWithHandle("order.confirmed", func(order Order) {
+	orderConfirmedHandle, _ := orderBus.Subscribe("order.confirmed", func(ctx context.Context, order Order) error {
 		fmt.Printf("🎉 [ORDER-SERVICE] Order confirmed: %s\n", order.ID)
 
 		// Trigger shipping process
 		fmt.Printf("📮 [SHIPPING-SERVICE] Shipping initiated for order %s\n", order.ID)
+		return nil
 	})
 
 	// Order Cancelled Handler
-	orderCancelledHandle := orderBus.SubscribeWithHandle("order.cancelled", func(order Order) {
+	orderCancelledHandle, _ := orderBus.Subscribe("order.cancelled", func(ctx context.Context, order Order) error {
 		fmt.Printf("❌ [ORDER-SERVICE] Order cancelled: %s\n", order.ID)
 
 		// Release reserved inventory (simulation)
@@ -187,17 +195,20 @@ func processOrderWorkflow(orderBus bus.Bus[Order], paymentBus bus.Bus[Payment], 
 			Quantity:  1,
 			Operation: "release",
 		})
+		return nil
 	})
 
 	// Notification Service - sends notifications (low priority)
-	notificationHandle := orderBus.SubscribeWithPriority("order.confirmed", func(order Order) {
+	notificationHandle, _ := orderBus.Subscribe("order.confirmed", func(ctx context.Context, order Order) error {
 		fmt.Printf("📧 [NOTIFICATION-SERVICE] Sending confirmation email for order %s\n", order.ID)
-	}, bus.PriorityLow)
+		return nil
+	}, bus.HandlerPriority(bus.PriorityLow))
 
 	// Analytics Service - tracks metrics (lowest priority)
-	analyticsHandle := orderBus.SubscribeWithPriority("order.created", func(order Order) {
+	analyticsHandle, _ := orderBus.Subscribe("order.created", func(ctx context.Context, order Order) error {
 		fmt.Printf("📊 [ANALYTICS-SERVICE] Recording order metrics for %s\n", order.ID)
-	}, bus.PriorityLow)
+		return nil
+	}, bus.HandlerPriority(bus.PriorityLow))
 
 	defer func() {
 		orderCreatedHandle.Unsubscribe()

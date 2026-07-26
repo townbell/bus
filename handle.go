@@ -9,20 +9,16 @@ import (
 
 // Handle represents a subscription handle that can be used to unsubscribe
 type Handle[T any] struct {
-	bus      *EventBus[T]
-	topic    string
-	handler  *eventHandler[T]
-	priority Priority
-	filter   EventFilter[T]
-	ctx      context.Context
-	mu       sync.Mutex
+	bus     *EventBus[T]
+	topic   string
+	handler *eventHandler[T]
+	mu      sync.Mutex
 }
 
 // Unsubscribe removes this specific subscription.
 //
-// A nil handle is reported as an error rather than a panic. Subscribe helpers
-// that return only a handle yield nil when the subscription is rejected (nil
-// callback, or a closed bus), so a deferred Unsubscribe must stay safe.
+// A nil handle is reported as an error rather than a panic, so ignoring the
+// error from Subscribe and deferring Unsubscribe stays safe.
 func (h *Handle[T]) Unsubscribe() error {
 	if h == nil {
 		return fmt.Errorf("handle is nil: the subscription was never created")
@@ -62,7 +58,7 @@ func (h *Handle[T]) IsActive() bool {
 type eventHandler[T any] struct {
 	id             string
 	topic          string
-	callBack       func(T)
+	callBack       Handler[T]
 	flagOnce       bool
 	async          bool
 	transactional  bool

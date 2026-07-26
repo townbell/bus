@@ -2,6 +2,7 @@ package bus
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -89,241 +90,18 @@ func New(opts ...Option[any]) *EventBus[any] {
 	return NewTyped[any](opts...)
 }
 
-// doSubscribe handles the subscription logic and is utilized by the public Subscribe functions
-func (bus *EventBus[T]) doSubscribe(topic string, fn func(T), handler *eventHandler[T]) error {
+// Subscribe registers fn for topic and returns a handle that cancels the
+// subscription. Behavior is configured through HandlerOption values; with no
+// options the handler runs synchronously at PriorityNormal.
+//
+// Subscribe reports why a subscription was rejected: a nil handler, a filter
+// whose event type does not match the bus, or a closed bus. On error the
+// returned handle is nil; a nil handle is still safe to use.
+func (bus *EventBus[T]) Subscribe(topic string, fn Handler[T], options ...HandlerOption) (*Handle[T], error) {
 	if fn == nil {
-		return fmt.Errorf("event handler is nil")
-	}
-	if handler.ctx == nil {
-		handler.ctx = context.Background()
-	}
-	handler.topic = topic
-
-	bus.lock.Lock()
-	defer bus.lock.Unlock()
-
-	if bus.closed {
-		return fmt.Errorf("event bus is closed")
-	}
-	bus.prepareHandlerLocked(topic, handler)
-
-	// Insert handler based on priority
-	handlers := bus.handlers[topic]
-	inserted := false
-
-	for i, h := range handlers {
-		if handler.priority > h.priority {
-			// Insert before this handler
-			handlers = append(handlers[:i], append([]*eventHandler[T]{handler}, handlers[i:]...)...)
-			inserted = true
-			break
-		}
+		return nil, fmt.Errorf("event handler is nil")
 	}
 
-	if !inserted {
-		handlers = append(handlers, handler)
-	}
-
-	bus.handlers[topic] = handlers
-	bus.metrics.IncrementSubscribers()
-
-	// Log subscription
-	if bus.logger != nil {
-		bus.logger.Debug("Handler subscribed to topic '%s' with priority %v", topic, handler.priority)
-	}
-
-	return nil
-}
-
-// doSubscribeWithHandle handles the subscription logic and returns a handle
-func (bus *EventBus[T]) doSubscribeWithHandle(topic string, fn func(T), handler *eventHandler[T]) *Handle[T] {
-	if fn == nil {
-		return nil
-	}
-	if handler.ctx == nil {
-		handler.ctx = context.Background()
-	}
-	handler.topic = topic
-
-	bus.lock.Lock()
-	defer bus.lock.Unlock()
-
-	if bus.closed {
-		return nil
-	}
-	bus.prepareHandlerLocked(topic, handler)
-
-	// Insert handler based on priority (same logic as doSubscribe)
-	handlers := bus.handlers[topic]
-	inserted := false
-
-	for i, h := range handlers {
-		if handler.priority > h.priority {
-			handlers = append(handlers[:i], append([]*eventHandler[T]{handler}, handlers[i:]...)...)
-			inserted = true
-			break
-		}
-	}
-
-	if !inserted {
-		handlers = append(handlers, handler)
-	}
-
-	bus.handlers[topic] = handlers
-	bus.metrics.IncrementSubscribers()
-
-	// Log subscription
-	if bus.logger != nil {
-		bus.logger.Debug("Handler subscribed to topic '%s' with priority %v (with handle)", topic, handler.priority)
-	}
-
-	return &Handle[T]{
-		bus:      bus,
-		topic:    topic,
-		handler:  handler,
-		priority: handler.priority,
-		filter:   handler.filter,
-		ctx:      handler.ctx,
-	}
-}
-
-func (bus *EventBus[T]) prepareHandlerLocked(topic string, handler *eventHandler[T]) {
-	bus.nextHandlerID++
-	handler.id = topic + "#" + strconv.FormatUint(bus.nextHandlerID, 10)
-	if handler.maxConcurrency > 0 && handler.concurrency == nil {
-		handler.concurrency = make(chan struct{}, handler.maxConcurrency)
-	}
-}
-
-// Subscribe subscribes to a topic.
-func (bus *EventBus[T]) Subscribe(topic string, fn func(T)) error {
-	return bus.doSubscribe(topic, fn, &eventHandler[T]{
-		callBack:      fn,
-		flagOnce:      false,
-		async:         false,
-		transactional: false,
-		priority:      PriorityNormal,
-		ctx:           context.Background(),
-		recoverPolicy: RecoverAndContinue,
-		Mutex:         sync.Mutex{},
-	})
-}
-
-// SubscribeWithHandle subscribes to a topic and returns a handle for unsubscription.
-func (bus *EventBus[T]) SubscribeWithHandle(topic string, fn func(T)) *Handle[T] {
-	return bus.doSubscribeWithHandle(topic, fn, &eventHandler[T]{
-		callBack:      fn,
-		flagOnce:      false,
-		async:         false,
-		transactional: false,
-		priority:      PriorityNormal,
-		ctx:           context.Background(),
-		recoverPolicy: RecoverAndContinue,
-		Mutex:         sync.Mutex{},
-	})
-}
-
-// SubscribeWithPriority subscribes to a topic with specified priority
-func (bus *EventBus[T]) SubscribeWithPriority(topic string, fn func(T), priority Priority) *Handle[T] {
-	return bus.doSubscribeWithHandle(topic, fn, &eventHandler[T]{
-		callBack:      fn,
-		flagOnce:      false,
-		async:         false,
-		transactional: false,
-		priority:      priority,
-		ctx:           context.Background(),
-		recoverPolicy: RecoverAndContinue,
-		Mutex:         sync.Mutex{},
-	})
-}
-
-// SubscribeWithFilter subscribes to a topic with an event filter
-func (bus *EventBus[T]) SubscribeWithFilter(topic string, fn func(T), filter EventFilter[T]) *Handle[T] {
-	return bus.doSubscribeWithHandle(topic, fn, &eventHandler[T]{
-		callBack:      fn,
-		flagOnce:      false,
-		async:         false,
-		transactional: false,
-		priority:      PriorityNormal,
-		filter:        filter,
-		ctx:           context.Background(),
-		recoverPolicy: RecoverAndContinue,
-		Mutex:         sync.Mutex{},
-	})
-}
-
-// SubscribeWithContext subscribes to a topic with context for cancellation
-func (bus *EventBus[T]) SubscribeWithContext(ctx context.Context, topic string, fn func(T)) *Handle[T] {
-	return bus.doSubscribeWithHandle(topic, fn, &eventHandler[T]{
-		callBack:      fn,
-		flagOnce:      false,
-		async:         false,
-		transactional: false,
-		priority:      PriorityNormal,
-		ctx:           ctx,
-		recoverPolicy: RecoverAndContinue,
-		Mutex:         sync.Mutex{},
-	})
-}
-
-// SubscribeAsync subscribes to a topic with an asynchronous callback
-func (bus *EventBus[T]) SubscribeAsync(topic string, fn func(T), transactional bool) error {
-	return bus.doSubscribe(topic, fn, &eventHandler[T]{
-		callBack:      fn,
-		flagOnce:      false,
-		async:         true,
-		transactional: transactional,
-		priority:      PriorityNormal,
-		ctx:           context.Background(),
-		recoverPolicy: RecoverAndContinue,
-		Mutex:         sync.Mutex{},
-	})
-}
-
-// SubscribeAsyncWithHandle subscribes to a topic with an asynchronous callback and returns a handle.
-func (bus *EventBus[T]) SubscribeAsyncWithHandle(topic string, fn func(T), transactional bool) *Handle[T] {
-	return bus.doSubscribeWithHandle(topic, fn, &eventHandler[T]{
-		callBack:      fn,
-		flagOnce:      false,
-		async:         true,
-		transactional: transactional,
-		priority:      PriorityNormal,
-		ctx:           context.Background(),
-		recoverPolicy: RecoverAndContinue,
-		Mutex:         sync.Mutex{},
-	})
-}
-
-// SubscribeOnce subscribes to a topic once. Handler will be removed after executing.
-func (bus *EventBus[T]) SubscribeOnce(topic string, fn func(T)) error {
-	return bus.doSubscribe(topic, fn, &eventHandler[T]{
-		callBack:      fn,
-		flagOnce:      true,
-		async:         false,
-		transactional: false,
-		priority:      PriorityNormal,
-		ctx:           context.Background(),
-		recoverPolicy: RecoverAndContinue,
-		Mutex:         sync.Mutex{},
-	})
-}
-
-// SubscribeOnceAsync subscribes to a topic once with an asynchronous callback
-func (bus *EventBus[T]) SubscribeOnceAsync(topic string, fn func(T)) error {
-	return bus.doSubscribe(topic, fn, &eventHandler[T]{
-		callBack:      fn,
-		flagOnce:      true,
-		async:         true,
-		transactional: false,
-		priority:      PriorityNormal,
-		ctx:           context.Background(),
-		recoverPolicy: RecoverAndContinue,
-		Mutex:         sync.Mutex{},
-	})
-}
-
-// SubscribeWithOptions subscribes to a topic with handler-level execution controls.
-func (bus *EventBus[T]) SubscribeWithOptions(topic string, fn func(T), options ...HandlerOption) (*Handle[T], error) {
 	opts := defaultHandlerOptions()
 	for _, option := range options {
 		if option != nil {
@@ -334,26 +112,68 @@ func (bus *EventBus[T]) SubscribeWithOptions(topic string, fn func(T), options .
 		opts.ctx = context.Background()
 	}
 
+	var filter EventFilter[T]
+	if opts.filter != nil {
+		typed, ok := opts.filter.(EventFilter[T])
+		if !ok {
+			return nil, fmt.Errorf("handler filter is %T, want a filter for event type %T", opts.filter, *new(T))
+		}
+		filter = typed
+	}
+
 	handler := &eventHandler[T]{
 		callBack:       fn,
+		topic:          topic,
 		flagOnce:       opts.once,
 		async:          opts.async,
 		transactional:  opts.transactional,
 		priority:       opts.priority,
+		filter:         filter,
 		ctx:            opts.ctx,
 		timeout:        opts.timeout,
 		recoverPolicy:  opts.recoverPolicy,
 		maxConcurrency: opts.maxConcurrency,
 		Mutex:          sync.Mutex{},
 	}
-	handle := bus.doSubscribeWithHandle(topic, fn, handler)
-	if handle == nil {
-		if fn == nil {
-			return nil, fmt.Errorf("event handler is nil")
-		}
+
+	bus.lock.Lock()
+	defer bus.lock.Unlock()
+
+	if bus.closed {
 		return nil, fmt.Errorf("event bus is closed")
 	}
-	return handle, nil
+	bus.prepareHandlerLocked(topic, handler)
+
+	// Insert before the first handler with strictly lower priority, so equal
+	// priorities keep subscription order.
+	handlers := bus.handlers[topic]
+	inserted := false
+	for i, h := range handlers {
+		if handler.priority > h.priority {
+			handlers = append(handlers[:i], append([]*eventHandler[T]{handler}, handlers[i:]...)...)
+			inserted = true
+			break
+		}
+	}
+	if !inserted {
+		handlers = append(handlers, handler)
+	}
+	bus.handlers[topic] = handlers
+	bus.metrics.IncrementSubscribers()
+
+	if bus.logger != nil {
+		bus.logger.Debug("Handler subscribed to topic '%s' with priority %v", topic, handler.priority)
+	}
+
+	return &Handle[T]{bus: bus, topic: topic, handler: handler}, nil
+}
+
+func (bus *EventBus[T]) prepareHandlerLocked(topic string, handler *eventHandler[T]) {
+	bus.nextHandlerID++
+	handler.id = topic + "#" + strconv.FormatUint(bus.nextHandlerID, 10)
+	if handler.maxConcurrency > 0 && handler.concurrency == nil {
+		handler.concurrency = make(chan struct{}, handler.maxConcurrency)
+	}
 }
 
 // HasCallback returns true if exists any callback subscribed to the topic.
@@ -367,12 +187,17 @@ func (bus *EventBus[T]) HasCallback(topic string) bool {
 	return false
 }
 
-// Publish executes callback defined for a topic.
-func (bus *EventBus[T]) Publish(topic string, event T) {
-	bus.PublishWithContext(context.Background(), topic, event)
+// Publish delivers event to the topic's handlers. The returned error joins
+// the failures of the synchronous handlers, and is safe to ignore when
+// delivery failures do not matter to the caller. Asynchronous handler
+// failures are reported through the ErrorHandler instead.
+func (bus *EventBus[T]) Publish(topic string, event T) error {
+	return bus.PublishWithContext(context.Background(), topic, event)
 }
 
-// PublishWithContext publishes an event with context
+// PublishWithContext publishes an event with context. Canceling the context
+// aborts dispatch to the remaining handlers and cancels the context passed to
+// the currently running synchronous handler.
 func (bus *EventBus[T]) PublishWithContext(ctx context.Context, topic string, event T) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -451,12 +276,17 @@ func runMiddlewares(middlewares []EventMiddleware[any], topic string, event any,
 }
 
 func (bus *EventBus[T]) dispatch(ctx context.Context, topic string, event T, handlers []*eventHandler[T], closeCh <-chan struct{}, logger Logger, errorHandler ErrorHandler, metrics Metrics) error {
+	var errs []error
+	abort := func(err error) error {
+		return errors.Join(append(errs, err)...)
+	}
+
 	for _, handler := range handlers {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return abort(ctx.Err())
 		case <-closeCh:
-			return fmt.Errorf("event bus is closed")
+			return abort(fmt.Errorf("event bus is closed"))
 		default:
 		}
 
@@ -477,21 +307,25 @@ func (bus *EventBus[T]) dispatch(ctx context.Context, topic string, event T, han
 		}
 
 		if !handler.async {
-			if err := bus.doPublish(ctx, closeCh, handler, topic, event, logger, errorHandler, metrics); err != nil {
-				return err
+			err, stop := bus.doPublish(ctx, closeCh, handler, topic, event, logger, errorHandler, metrics)
+			if err != nil {
+				errs = append(errs, err)
+			}
+			if stop {
+				return errors.Join(errs...)
 			}
 			continue
 		}
 
 		if !bus.addAsync() {
-			return fmt.Errorf("event bus is closed")
+			return abort(fmt.Errorf("event bus is closed"))
 		}
 		if handler.transactional {
 			handler.Lock()
 		}
 		go bus.doPublishAsync(handler, topic, event, closeCh, logger, errorHandler, metrics)
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 func (bus *EventBus[T]) addAsync() bool {
@@ -519,7 +353,9 @@ func (e *handlerPanicError) Error() string {
 	return fmt.Sprintf("panic: %v", e.value)
 }
 
-func (bus *EventBus[T]) doPublish(ctx context.Context, closeCh <-chan struct{}, handler *eventHandler[T], topic string, event T, logger Logger, errorHandler ErrorHandler, metrics Metrics) error {
+// doPublish runs one handler and records the outcome. The second return value
+// reports whether dispatch must stop (a recovered panic under RecoverAndStop).
+func (bus *EventBus[T]) doPublish(ctx context.Context, closeCh <-chan struct{}, handler *eventHandler[T], topic string, event T, logger Logger, errorHandler ErrorHandler, metrics Metrics) (error, bool) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -528,40 +364,39 @@ func (bus *EventBus[T]) doPublish(ctx context.Context, closeCh <-chan struct{}, 
 	err := bus.runHandler(ctx, closeCh, handler, event)
 	duration := time.Since(start)
 
-	if err != nil {
+	if err == nil {
 		if logger != nil {
-			if _, ok := err.(*handlerPanicError); ok {
-				logger.Error("Handler panic for topic '%s': %v", topic, err)
-			} else {
-				logger.Error("Handler failed for topic '%s': %v", topic, err)
-			}
+			logger.Debug("Handler executed successfully for topic '%s'", topic)
 		}
-		if errorHandler != nil {
-			errorHandler(&EventError{
-				Topic:   topic,
-				Event:   event,
-				Handler: handler.callBack,
-				Err:     err,
-			})
-		}
-		metrics.IncrementFailed()
+		metrics.IncrementProcessed()
 		if detailed, ok := metrics.(DetailedMetrics); ok {
-			detailed.RecordFailed(topic, handler.id, duration)
+			detailed.RecordProcessed(topic, handler.id, duration)
 		}
-		if _, ok := err.(*handlerPanicError); ok && handler.recoverPolicy == RecoverAndContinue {
-			return nil
-		}
-		return err
+		return nil, false
 	}
 
+	var panicErr *handlerPanicError
+	isPanic := errors.As(err, &panicErr)
 	if logger != nil {
-		logger.Debug("Handler executed successfully for topic '%s'", topic)
+		if isPanic {
+			logger.Error("Handler panic for topic '%s': %v", topic, err)
+		} else {
+			logger.Error("Handler failed for topic '%s': %v", topic, err)
+		}
 	}
-	metrics.IncrementProcessed()
+	if errorHandler != nil {
+		errorHandler(&EventError{
+			Topic:   topic,
+			Event:   event,
+			Handler: handler.callBack,
+			Err:     err,
+		})
+	}
+	metrics.IncrementFailed()
 	if detailed, ok := metrics.(DetailedMetrics); ok {
-		detailed.RecordProcessed(topic, handler.id, duration)
+		detailed.RecordFailed(topic, handler.id, duration)
 	}
-	return nil
+	return err, isPanic && handler.recoverPolicy == RecoverAndStop
 }
 
 func (bus *EventBus[T]) runHandler(ctx context.Context, closeCh <-chan struct{}, handler *eventHandler[T], event T) error {
@@ -615,8 +450,7 @@ func (bus *EventBus[T]) runHandlerWithoutTimeout(ctx context.Context, closeCh <-
 			err = &handlerPanicError{value: r}
 		}
 	}()
-	handler.callBack(event)
-	return nil
+	return handler.callBack(ctx, event)
 }
 
 func acquireConcurrency[T any](ctx context.Context, closeCh <-chan struct{}, handler *eventHandler[T]) error {
@@ -641,7 +475,13 @@ func (bus *EventBus[T]) doPublishAsync(handler *eventHandler[T], topic string, e
 		}
 	}()
 
-	_ = bus.doPublish(context.Background(), closeCh, handler, topic, event, logger, errorHandler, metrics)
+	// The publish call may already have returned, so asynchronous handlers run
+	// under the subscription context rather than the publish context.
+	ctx := handler.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	_, _ = bus.doPublish(ctx, closeCh, handler, topic, event, logger, errorHandler, metrics)
 }
 
 func (bus *EventBus[T]) removeHandler(topic string, target *eventHandler[T]) bool {

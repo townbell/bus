@@ -2,7 +2,9 @@ package bus
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -14,6 +16,19 @@ type TestEvent struct {
 	Value int
 }
 
+// discard is a handler that succeeds without doing anything.
+func discard[T any](context.Context, T) error { return nil }
+
+// mustSubscribe fails the test when the subscription is rejected.
+func mustSubscribe[T any](tb testing.TB, b *EventBus[T], topic string, fn Handler[T], opts ...HandlerOption) *Handle[T] {
+	tb.Helper()
+	handle, err := b.Subscribe(topic, fn, opts...)
+	if err != nil {
+		tb.Fatalf("Subscribe(%q): %v", topic, err)
+	}
+	return handle
+}
+
 func TestBasicPublishSubscribe(t *testing.T) {
 	bus := NewTyped[TestEvent]()
 	defer bus.Close()
@@ -22,13 +37,16 @@ func TestBasicPublishSubscribe(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(1)
 
-	handle := bus.SubscribeWithHandle("test.topic", func(event TestEvent) {
+	handle := mustSubscribe(t, bus, "test.topic", func(ctx context.Context, event TestEvent) error {
 		received = event
 		wg.Done()
+		return nil
 	})
 	defer handle.Unsubscribe()
 
-	bus.Publish("test.topic", TestEvent{ID: "test1", Value: 42})
+	if err := bus.Publish("test.topic", TestEvent{ID: "test1", Value: 42}); err != nil {
+		t.Fatalf("Unexpected publish error: %v", err)
+	}
 	wg.Wait()
 
 	if received.ID != "test1" || received.Value != 42 {
@@ -42,34 +60,19 @@ func TestPriorityHandling(t *testing.T) {
 
 	var executionOrder []string
 	var mu sync.Mutex
+	record := func(name string) Handler[TestEvent] {
+		return func(ctx context.Context, event TestEvent) error {
+			mu.Lock()
+			executionOrder = append(executionOrder, name)
+			mu.Unlock()
+			return nil
+		}
+	}
 
-	// Low priority
-	bus.SubscribeWithPriority("priority.test", func(event TestEvent) {
-		mu.Lock()
-		executionOrder = append(executionOrder, "low")
-		mu.Unlock()
-	}, PriorityLow)
-
-	// High priority
-	bus.SubscribeWithPriority("priority.test", func(event TestEvent) {
-		mu.Lock()
-		executionOrder = append(executionOrder, "high")
-		mu.Unlock()
-	}, PriorityHigh)
-
-	// Normal priority
-	bus.SubscribeWithPriority("priority.test", func(event TestEvent) {
-		mu.Lock()
-		executionOrder = append(executionOrder, "normal")
-		mu.Unlock()
-	}, PriorityNormal)
-
-	// Critical priority
-	bus.SubscribeWithPriority("priority.test", func(event TestEvent) {
-		mu.Lock()
-		executionOrder = append(executionOrder, "critical")
-		mu.Unlock()
-	}, PriorityCritical)
+	mustSubscribe(t, bus, "priority.test", record("low"), HandlerPriority(PriorityLow))
+	mustSubscribe(t, bus, "priority.test", record("high"), HandlerPriority(PriorityHigh))
+	mustSubscribe(t, bus, "priority.test", record("normal"), HandlerPriority(PriorityNormal))
+	mustSubscribe(t, bus, "priority.test", record("critical"), HandlerPriority(PriorityCritical))
 
 	bus.Publish("priority.test", TestEvent{ID: "priority", Value: 1})
 	bus.WaitAsync()
@@ -98,19 +101,21 @@ func TestEventFiltering(t *testing.T) {
 	var mu sync.Mutex
 
 	// Filter: only process events with Value > 10
-	bus.SubscribeWithFilter("filter.test", func(event TestEvent) {
+	mustSubscribe(t, bus, "filter.test", func(ctx context.Context, event TestEvent) error {
 		mu.Lock()
 		filteredEvents = append(filteredEvents, event)
 		mu.Unlock()
-	}, func(topic string, event TestEvent) bool {
+		return nil
+	}, HandlerFilter(func(topic string, event TestEvent) bool {
 		return event.Value > 10
-	})
+	}))
 
 	// Process all events
-	bus.SubscribeWithHandle("filter.test", func(event TestEvent) {
+	mustSubscribe(t, bus, "filter.test", func(ctx context.Context, event TestEvent) error {
 		mu.Lock()
 		allEvents = append(allEvents, event)
 		mu.Unlock()
+		return nil
 	})
 
 	// Publish test events
@@ -145,6 +150,20 @@ func TestEventFiltering(t *testing.T) {
 	}
 }
 
+func TestFilterTypeMismatchIsRejected(t *testing.T) {
+	bus := NewTyped[TestEvent]()
+	defer bus.Close()
+
+	handle, err := bus.Subscribe("filter.mismatch", discard[TestEvent],
+		HandlerFilter(func(topic string, event string) bool { return true }))
+	if err == nil {
+		t.Fatal("Expected an error for a filter with the wrong event type")
+	}
+	if handle != nil {
+		t.Fatal("Expected a nil handle for a rejected subscription")
+	}
+}
+
 func TestContextCancellation(t *testing.T) {
 	bus := NewTyped[TestEvent]()
 	defer bus.Close()
@@ -152,9 +171,10 @@ func TestContextCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	var processedCount int32
 
-	handle := bus.SubscribeWithContext(ctx, "context.test", func(event TestEvent) {
+	handle := mustSubscribe(t, bus, "context.test", func(ctx context.Context, event TestEvent) error {
 		atomic.AddInt32(&processedCount, 1)
-	})
+		return nil
+	}, HandlerContext(ctx))
 	defer handle.Unsubscribe()
 
 	// Publish first event (should be processed)
@@ -177,7 +197,7 @@ func TestContextCancellation(t *testing.T) {
 	}
 }
 
-func TestErrorHandling(t *testing.T) {
+func TestPanicIsRecoveredAndReported(t *testing.T) {
 	bus := NewTyped[TestEvent]()
 	defer bus.Close()
 
@@ -190,18 +210,24 @@ func TestErrorHandling(t *testing.T) {
 	})
 
 	// Subscribe a handler that will panic
-	bus.SubscribeWithHandle("error.test", func(event TestEvent) {
+	mustSubscribe(t, bus, "error.test", func(ctx context.Context, event TestEvent) error {
 		if event.Value < 0 {
 			panic("negative value")
 		}
 		atomic.AddInt32(&normalCount, 1)
+		return nil
 	})
 
 	// Publish normal event
-	bus.Publish("error.test", TestEvent{ID: "normal", Value: 5})
+	if err := bus.Publish("error.test", TestEvent{ID: "normal", Value: 5}); err != nil {
+		t.Fatalf("Unexpected publish error: %v", err)
+	}
 
-	// Publish event that will cause panic
-	bus.Publish("error.test", TestEvent{ID: "panic", Value: -1})
+	// Publish event that will cause panic: the panic is recovered, reported,
+	// and joined into the publish error.
+	if err := bus.Publish("error.test", TestEvent{ID: "panic", Value: -1}); err == nil {
+		t.Fatal("Expected the recovered panic in the publish error")
+	}
 
 	bus.WaitAsync()
 
@@ -214,17 +240,84 @@ func TestErrorHandling(t *testing.T) {
 	}
 }
 
+func TestHandlerErrorsAreJoinedAndDispatchContinues(t *testing.T) {
+	bus := NewTyped[TestEvent]()
+	defer bus.Close()
+
+	errFirst := errors.New("first failure")
+	errSecond := errors.New("second failure")
+	var reported int32
+	var thirdRan int32
+
+	bus.SetErrorHandler(func(err *EventError) {
+		atomic.AddInt32(&reported, 1)
+	})
+
+	mustSubscribe(t, bus, "errors.join", func(ctx context.Context, event TestEvent) error {
+		return errFirst
+	}, HandlerPriority(PriorityHigh))
+	mustSubscribe(t, bus, "errors.join", func(ctx context.Context, event TestEvent) error {
+		return errSecond
+	}, HandlerPriority(PriorityNormal))
+	mustSubscribe(t, bus, "errors.join", func(ctx context.Context, event TestEvent) error {
+		atomic.AddInt32(&thirdRan, 1)
+		return nil
+	}, HandlerPriority(PriorityLow))
+
+	err := bus.Publish("errors.join", TestEvent{ID: "join", Value: 1})
+	if !errors.Is(err, errFirst) || !errors.Is(err, errSecond) {
+		t.Fatalf("Expected both handler errors in the joined publish error, got %v", err)
+	}
+	if atomic.LoadInt32(&thirdRan) != 1 {
+		t.Fatal("Expected dispatch to continue past failing handlers")
+	}
+	if atomic.LoadInt32(&reported) != 2 {
+		t.Fatalf("Expected 2 errors reported to the ErrorHandler, got %d", reported)
+	}
+
+	_, _, failed, _ := bus.GetMetrics().GetStats()
+	if failed != 2 {
+		t.Fatalf("Expected 2 failed deliveries in metrics, got %d", failed)
+	}
+}
+
+func TestAsyncHandlerErrorGoesToErrorHandler(t *testing.T) {
+	bus := NewTyped[TestEvent]()
+	defer bus.Close()
+
+	errAsync := errors.New("async failure")
+	reported := make(chan error, 1)
+	bus.SetErrorHandler(func(err *EventError) {
+		reported <- err.Err
+	})
+
+	mustSubscribe(t, bus, "errors.async", func(ctx context.Context, event TestEvent) error {
+		return errAsync
+	}, HandlerAsync(false))
+
+	// The async handler's failure is not part of the publish error.
+	if err := bus.Publish("errors.async", TestEvent{ID: "async", Value: 1}); err != nil {
+		t.Fatalf("Expected no publish error for an async handler failure, got %v", err)
+	}
+	bus.WaitAsync()
+
+	select {
+	case err := <-reported:
+		if !errors.Is(err, errAsync) {
+			t.Fatalf("Expected the async handler error, got %v", err)
+		}
+	default:
+		t.Fatal("Expected the async handler error to reach the ErrorHandler")
+	}
+}
+
 func TestMetrics(t *testing.T) {
 	bus := NewTyped[TestEvent]()
 	defer bus.Close()
 
 	// Subscribe handlers
-	handle1 := bus.SubscribeWithHandle("metrics.test", func(event TestEvent) {
-		// Normal processing
-	})
-	handle2 := bus.SubscribeWithHandle("metrics.test", func(event TestEvent) {
-		// Normal processing
-	})
+	handle1 := mustSubscribe(t, bus, "metrics.test", discard[TestEvent])
+	handle2 := mustSubscribe(t, bus, "metrics.test", discard[TestEvent])
 
 	defer func() {
 		handle1.Unsubscribe()
@@ -279,8 +372,9 @@ func TestMiddleware(t *testing.T) {
 	})
 
 	// Subscribe handler
-	bus.SubscribeWithHandle("middleware.test", func(event TestEvent) {
+	mustSubscribe(t, bus, "middleware.test", func(ctx context.Context, event TestEvent) error {
 		atomic.AddInt32(&handlerCalled, 1)
+		return nil
 	})
 
 	// Publish event
@@ -305,8 +399,9 @@ func TestMiddlewareCanSkipHandlers(t *testing.T) {
 	bus.AddMiddleware(func(topic string, event interface{}, next func()) error {
 		return nil
 	})
-	bus.SubscribeWithHandle("middleware.skip.test", func(event TestEvent) {
+	mustSubscribe(t, bus, "middleware.skip.test", func(ctx context.Context, event TestEvent) error {
 		atomic.AddInt32(&handlerCalled, 1)
+		return nil
 	})
 
 	bus.Publish("middleware.skip.test", TestEvent{ID: "test", Value: 1})
@@ -326,8 +421,9 @@ func TestMiddlewareNextIsIdempotent(t *testing.T) {
 		next()
 		return nil
 	})
-	bus.SubscribeWithHandle("middleware.next.once", func(event TestEvent) {
+	mustSubscribe(t, bus, "middleware.next.once", func(ctx context.Context, event TestEvent) error {
 		atomic.AddInt32(&handlerCalled, 1)
+		return nil
 	})
 
 	bus.Publish("middleware.next.once", TestEvent{ID: "test", Value: 1})
@@ -354,8 +450,9 @@ func TestMiddlewareNextIsConcurrentSafe(t *testing.T) {
 		wg.Wait()
 		return nil
 	})
-	bus.SubscribeWithHandle("middleware.next.concurrent", func(event TestEvent) {
+	mustSubscribe(t, bus, "middleware.next.concurrent", func(ctx context.Context, event TestEvent) error {
 		atomic.AddInt32(&handlerCalled, 1)
+		return nil
 	})
 
 	bus.Publish("middleware.next.concurrent", TestEvent{ID: "test", Value: 1})
@@ -370,12 +467,13 @@ func TestPublishDoesNotHoldBusLockDuringHandler(t *testing.T) {
 	defer bus.Close()
 
 	done := make(chan struct{})
-	bus.SubscribeWithHandle("lock.test", func(event TestEvent) {
-		handle := bus.SubscribeWithHandle("lock.test.extra", func(event TestEvent) {})
-		if handle != nil {
+	mustSubscribe(t, bus, "lock.test", func(ctx context.Context, event TestEvent) error {
+		handle, err := bus.Subscribe("lock.test.extra", discard[TestEvent])
+		if err == nil {
 			handle.Unsubscribe()
 		}
 		close(done)
+		return nil
 	})
 
 	go bus.Publish("lock.test", TestEvent{ID: "lock", Value: 1})
@@ -392,9 +490,10 @@ func TestPublishWithTimeout(t *testing.T) {
 	defer bus.Close()
 
 	// Subscribe a synchronous handler that will block for a long time
-	bus.SubscribeWithHandle("timeout.test", func(event TestEvent) {
+	mustSubscribe(t, bus, "timeout.test", func(ctx context.Context, event TestEvent) error {
 		// Simulate blocking operation
 		time.Sleep(100 * time.Millisecond)
+		return nil
 	})
 
 	// Test timeout publish (timeout shorter than processing time)
@@ -402,29 +501,28 @@ func TestPublishWithTimeout(t *testing.T) {
 	err := bus.PublishWithTimeout("timeout.test", TestEvent{ID: "timeout", Value: 1}, 50*time.Millisecond)
 	elapsed := time.Since(start)
 
-	if err == nil {
-		t.Error("Expected timeout error, got nil")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("Expected context.DeadlineExceeded in the publish error, got %v", err)
 	}
 
 	// Verify it returns around timeout time
 	if elapsed > 80*time.Millisecond {
 		t.Errorf("Expected timeout around 50ms, but took %v", elapsed)
 	}
+	bus.WaitAsync()
 }
 
 func TestHandlerTimeoutOption(t *testing.T) {
 	bus := NewTyped[TestEvent]()
 	defer bus.Close()
 
-	_, err := bus.SubscribeWithOptions("handler.timeout", func(event TestEvent) {
+	mustSubscribe(t, bus, "handler.timeout", func(ctx context.Context, event TestEvent) error {
 		time.Sleep(100 * time.Millisecond)
+		return nil
 	}, HandlerTimeout(20*time.Millisecond))
-	if err != nil {
-		t.Fatalf("Unexpected subscribe error: %v", err)
-	}
 
 	start := time.Now()
-	err = bus.PublishWithContext(context.Background(), "handler.timeout", TestEvent{ID: "timeout", Value: 1})
+	err := bus.PublishWithContext(context.Background(), "handler.timeout", TestEvent{ID: "timeout", Value: 1})
 	elapsed := time.Since(start)
 	if err == nil {
 		t.Fatal("Expected handler timeout error")
@@ -437,6 +535,34 @@ func TestHandlerTimeoutOption(t *testing.T) {
 	if failed != 1 {
 		t.Fatalf("Expected 1 failed handler, got %d", failed)
 	}
+	bus.WaitAsync()
+}
+
+func TestHandlerTimeoutCancelsHandlerContext(t *testing.T) {
+	bus := NewTyped[TestEvent]()
+	defer bus.Close()
+
+	canceled := make(chan struct{})
+	mustSubscribe(t, bus, "handler.timeout.ctx", func(ctx context.Context, event TestEvent) error {
+		select {
+		case <-ctx.Done():
+			close(canceled)
+			return ctx.Err()
+		case <-time.After(time.Second):
+			return fmt.Errorf("handler context was never canceled")
+		}
+	}, HandlerTimeout(10*time.Millisecond))
+
+	if err := bus.PublishWithContext(context.Background(), "handler.timeout.ctx", TestEvent{ID: "ctx", Value: 1}); err == nil {
+		t.Fatal("Expected handler timeout error")
+	}
+
+	bus.WaitAsync()
+	select {
+	case <-canceled:
+	default:
+		t.Fatal("Expected the handler context to be canceled at the timeout")
+	}
 }
 
 func TestHandlerTimeoutGoroutineIsWaited(t *testing.T) {
@@ -444,13 +570,11 @@ func TestHandlerTimeoutGoroutineIsWaited(t *testing.T) {
 	defer bus.Close()
 
 	done := make(chan struct{})
-	_, err := bus.SubscribeWithOptions("handler.timeout.wait", func(event TestEvent) {
+	mustSubscribe(t, bus, "handler.timeout.wait", func(ctx context.Context, event TestEvent) error {
 		time.Sleep(60 * time.Millisecond)
 		close(done)
+		return nil
 	}, HandlerTimeout(10*time.Millisecond))
-	if err != nil {
-		t.Fatalf("Unexpected subscribe error: %v", err)
-	}
 
 	if err := bus.PublishWithContext(context.Background(), "handler.timeout.wait", TestEvent{ID: "timeout", Value: 1}); err == nil {
 		t.Fatal("Expected handler timeout error")
@@ -469,13 +593,12 @@ func TestHandlerTimeoutCancelsConcurrencyWait(t *testing.T) {
 	defer bus.Close()
 
 	block := make(chan struct{})
-	if _, err := bus.SubscribeWithOptions("handler.timeout.concurrency", func(event TestEvent) {
+	mustSubscribe(t, bus, "handler.timeout.concurrency", func(ctx context.Context, event TestEvent) error {
 		if event.ID == "first" {
 			<-block
 		}
-	}, HandlerTimeout(10*time.Millisecond), HandlerMaxConcurrency(1)); err != nil {
-		t.Fatalf("Unexpected subscribe error: %v", err)
-	}
+		return nil
+	}, HandlerTimeout(10*time.Millisecond), HandlerMaxConcurrency(1))
 
 	firstDone := make(chan error, 1)
 	go func() {
@@ -514,8 +637,9 @@ func TestPublishWithNilContextUsesBackground(t *testing.T) {
 	defer bus.Close()
 
 	var called int32
-	bus.SubscribeWithHandle("nil.publish.context", func(event TestEvent) {
+	mustSubscribe(t, bus, "nil.publish.context", func(ctx context.Context, event TestEvent) error {
 		atomic.AddInt32(&called, 1)
+		return nil
 	})
 
 	if err := bus.PublishWithContext(nil, "nil.publish.context", TestEvent{ID: "nil", Value: 1}); err != nil {
@@ -531,22 +655,41 @@ func TestRecoverAndStopOption(t *testing.T) {
 	defer bus.Close()
 
 	var secondCalled int32
-	_, err := bus.SubscribeWithOptions("recover.stop", func(event TestEvent) {
+	mustSubscribe(t, bus, "recover.stop", func(ctx context.Context, event TestEvent) error {
 		panic("stop")
 	}, HandlerRecoverPolicy(RecoverAndStop), HandlerPriority(PriorityHigh))
-	if err != nil {
-		t.Fatalf("Unexpected subscribe error: %v", err)
-	}
-	bus.SubscribeWithPriority("recover.stop", func(event TestEvent) {
+	mustSubscribe(t, bus, "recover.stop", func(ctx context.Context, event TestEvent) error {
 		atomic.AddInt32(&secondCalled, 1)
-	}, PriorityLow)
+		return nil
+	}, HandlerPriority(PriorityLow))
 
-	err = bus.PublishWithContext(context.Background(), "recover.stop", TestEvent{ID: "panic", Value: 1})
+	err := bus.PublishWithContext(context.Background(), "recover.stop", TestEvent{ID: "panic", Value: 1})
 	if err == nil {
 		t.Fatal("Expected recovered panic to stop publish")
 	}
 	if atomic.LoadInt32(&secondCalled) != 0 {
 		t.Fatal("Expected lower priority handler to be skipped")
+	}
+}
+
+func TestReturnedErrorDoesNotStopDispatchUnderRecoverAndStop(t *testing.T) {
+	bus := NewTyped[TestEvent]()
+	defer bus.Close()
+
+	var secondCalled int32
+	mustSubscribe(t, bus, "recover.stop.error", func(ctx context.Context, event TestEvent) error {
+		return errors.New("business failure")
+	}, HandlerRecoverPolicy(RecoverAndStop), HandlerPriority(PriorityHigh))
+	mustSubscribe(t, bus, "recover.stop.error", func(ctx context.Context, event TestEvent) error {
+		atomic.AddInt32(&secondCalled, 1)
+		return nil
+	}, HandlerPriority(PriorityLow))
+
+	if err := bus.Publish("recover.stop.error", TestEvent{ID: "err", Value: 1}); err == nil {
+		t.Fatal("Expected the handler error in the publish error")
+	}
+	if atomic.LoadInt32(&secondCalled) != 1 {
+		t.Fatal("RecoverAndStop governs panics; a returned error must not stop dispatch")
 	}
 }
 
@@ -556,7 +699,7 @@ func TestHandlerMaxConcurrencyOption(t *testing.T) {
 
 	var current int32
 	var maxSeen int32
-	if _, err := bus.SubscribeWithOptions("max.concurrency", func(event TestEvent) {
+	mustSubscribe(t, bus, "max.concurrency", func(ctx context.Context, event TestEvent) error {
 		now := atomic.AddInt32(&current, 1)
 		for {
 			seen := atomic.LoadInt32(&maxSeen)
@@ -566,9 +709,8 @@ func TestHandlerMaxConcurrencyOption(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 		atomic.AddInt32(&current, -1)
-	}, HandlerAsync(false), HandlerMaxConcurrency(1)); err != nil {
-		t.Fatalf("Unexpected subscribe error: %v", err)
-	}
+		return nil
+	}, HandlerAsync(false), HandlerMaxConcurrency(1))
 
 	for i := 0; i < 3; i++ {
 		bus.Publish("max.concurrency", TestEvent{ID: fmt.Sprintf("%d", i), Value: i})
@@ -586,16 +728,16 @@ func TestHandleUnsubscribe(t *testing.T) {
 
 	var count int32
 
-	handle := bus.SubscribeWithHandle("unsubscribe.test", func(event TestEvent) {
+	handle := mustSubscribe(t, bus, "unsubscribe.test", func(ctx context.Context, event TestEvent) error {
 		atomic.AddInt32(&count, 1)
+		return nil
 	})
 
 	// Publish first event
 	bus.Publish("unsubscribe.test", TestEvent{ID: "first", Value: 1})
 
 	// Unsubscribe
-	err := handle.Unsubscribe()
-	if err != nil {
+	if err := handle.Unsubscribe(); err != nil {
 		t.Errorf("Unexpected error during unsubscribe: %v", err)
 	}
 
@@ -614,8 +756,7 @@ func TestHandleUnsubscribe(t *testing.T) {
 	}
 
 	// Unsubscribing again should return error
-	err = handle.Unsubscribe()
-	if err == nil {
+	if err := handle.Unsubscribe(); err == nil {
 		t.Error("Expected error when unsubscribing already unsubscribed handle")
 	}
 }
@@ -626,34 +767,31 @@ func TestBusClose(t *testing.T) {
 	var processed int32
 
 	// Subscribe handler
-	bus.SubscribeWithHandle("close.test", func(event TestEvent) {
+	mustSubscribe(t, bus, "close.test", func(ctx context.Context, event TestEvent) error {
 		atomic.AddInt32(&processed, 1)
+		return nil
 	})
 
 	// Publish event
 	bus.Publish("close.test", TestEvent{ID: "before_close", Value: 1})
 
 	// Close bus
-	err := bus.Close()
-	if err != nil {
+	if err := bus.Close(); err != nil {
 		t.Errorf("Unexpected error during close: %v", err)
 	}
 
 	// Try to publish again (should fail)
-	err = bus.PublishWithContext(context.Background(), "close.test", TestEvent{ID: "after_close", Value: 2})
-	if err == nil {
+	if err := bus.PublishWithContext(context.Background(), "close.test", TestEvent{ID: "after_close", Value: 2}); err == nil {
 		t.Error("Expected error when publishing to closed bus")
 	}
 
 	// Try to subscribe (should fail)
-	err = bus.Subscribe("close.test", func(event TestEvent) {})
-	if err == nil {
+	if _, err := bus.Subscribe("close.test", discard[TestEvent]); err == nil {
 		t.Error("Expected error when subscribing to closed bus")
 	}
 
 	// Closing again should return error
-	err = bus.Close()
-	if err == nil {
+	if err := bus.Close(); err == nil {
 		t.Error("Expected error when closing already closed bus")
 	}
 }
@@ -663,13 +801,12 @@ func TestBusCloseDoesNotDeadlockWhenAsyncHandlerUsesBus(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
 
-	if err := bus.SubscribeAsync("close.deadlock", func(event TestEvent) {
+	mustSubscribe(t, bus, "close.deadlock", func(ctx context.Context, event TestEvent) error {
 		close(started)
 		<-release
 		_ = bus.GetSubscriberCount("close.deadlock")
-	}, false); err != nil {
-		t.Fatalf("Unexpected subscribe error: %v", err)
-	}
+		return nil
+	}, HandlerAsync(false))
 
 	bus.Publish("close.deadlock", TestEvent{ID: "close", Value: 1})
 	<-started
@@ -694,8 +831,8 @@ func TestBusCloseDoesNotDeadlockWhenAsyncHandlerUsesBus(t *testing.T) {
 func TestBusCloseClearsSubscriberMetrics(t *testing.T) {
 	bus := NewTyped[TestEvent]()
 
-	bus.SubscribeWithHandle("close.metrics", func(event TestEvent) {})
-	bus.SubscribeWithHandle("close.metrics", func(event TestEvent) {})
+	mustSubscribe(t, bus, "close.metrics", discard[TestEvent])
+	mustSubscribe(t, bus, "close.metrics", discard[TestEvent])
 
 	if err := bus.Close(); err != nil {
 		t.Fatalf("Unexpected close error: %v", err)
@@ -719,11 +856,10 @@ func TestPublishDoesNotStartAsyncHandlerAfterClose(t *testing.T) {
 		next()
 		return nil
 	})
-	if err := bus.SubscribeAsync("close.publish", func(event TestEvent) {
+	mustSubscribe(t, bus, "close.publish", func(ctx context.Context, event TestEvent) error {
 		atomic.AddInt32(&processed, 1)
-	}, false); err != nil {
-		t.Fatalf("Unexpected subscribe error: %v", err)
-	}
+		return nil
+	}, HandlerAsync(false))
 
 	published := make(chan error, 1)
 	go func() {
@@ -755,8 +891,9 @@ func TestConcurrentPublishSubscribe(t *testing.T) {
 	// Create multiple subscribers
 	numSubscribers := 10
 	for i := 0; i < numSubscribers; i++ {
-		bus.SubscribeWithHandle("concurrent.test", func(event TestEvent) {
+		mustSubscribe(t, bus, "concurrent.test", func(ctx context.Context, event TestEvent) error {
 			atomic.AddInt64(&processed, 1)
+			return nil
 		})
 	}
 
@@ -797,9 +934,10 @@ func TestNew(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(1)
 
-	handle := bus.SubscribeWithHandle("new.test", func(event interface{}) {
+	handle := mustSubscribe(t, bus, "new.test", func(ctx context.Context, event any) error {
 		received = event
 		wg.Done()
+		return nil
 	})
 	defer handle.Unsubscribe()
 
@@ -830,14 +968,11 @@ func TestSubscribeAsync(t *testing.T) {
 	var wg sync.WaitGroup
 
 	// Test non-transactional async
-	err := bus.SubscribeAsync("async.test", func(event TestEvent) {
+	mustSubscribe(t, bus, "async.test", func(ctx context.Context, event TestEvent) error {
 		atomic.AddInt32(&processed, 1)
 		wg.Done()
-	}, false)
-
-	if err != nil {
-		t.Errorf("Unexpected error in SubscribeAsync: %v", err)
-	}
+		return nil
+	}, HandlerAsync(false))
 
 	wg.Add(1)
 	bus.Publish("async.test", TestEvent{ID: "async1", Value: 1})
@@ -848,64 +983,14 @@ func TestSubscribeAsync(t *testing.T) {
 	}
 
 	// Test transactional async
-	err = bus.SubscribeAsync("async.transactional", func(event TestEvent) {
+	mustSubscribe(t, bus, "async.transactional", func(ctx context.Context, event TestEvent) error {
 		atomic.AddInt32(&processed, 1)
 		wg.Done()
-	}, true)
-
-	if err != nil {
-		t.Errorf("Unexpected error in SubscribeAsync with transactional: %v", err)
-	}
+		return nil
+	}, HandlerAsync(true))
 
 	wg.Add(1)
 	bus.Publish("async.transactional", TestEvent{ID: "async2", Value: 2})
-	wg.Wait()
-
-	if count := atomic.LoadInt32(&processed); count != 2 {
-		t.Errorf("Expected 2 processed events, got %d", count)
-	}
-}
-
-// TestSubscribeAsyncWithHandle tests asynchronous subscription with handle
-func TestSubscribeAsyncWithHandle(t *testing.T) {
-	bus := NewTyped[TestEvent]()
-	defer bus.Close()
-
-	var processed int32
-	var wg sync.WaitGroup
-
-	// Test non-transactional async with handle
-	handle := bus.SubscribeAsyncWithHandle("async.handle.test", func(event TestEvent) {
-		atomic.AddInt32(&processed, 1)
-		wg.Done()
-	}, false)
-
-	if handle == nil {
-		t.Error("Expected handle to be returned, got nil")
-	}
-	defer handle.Unsubscribe()
-
-	wg.Add(1)
-	bus.Publish("async.handle.test", TestEvent{ID: "async_handle1", Value: 1})
-	wg.Wait()
-
-	if count := atomic.LoadInt32(&processed); count != 1 {
-		t.Errorf("Expected 1 processed event, got %d", count)
-	}
-
-	// Test transactional async with handle
-	handle2 := bus.SubscribeAsyncWithHandle("async.handle.transactional", func(event TestEvent) {
-		atomic.AddInt32(&processed, 1)
-		wg.Done()
-	}, true)
-
-	if handle2 == nil {
-		t.Error("Expected handle2 to be returned, got nil")
-	}
-	defer handle2.Unsubscribe()
-
-	wg.Add(1)
-	bus.Publish("async.handle.transactional", TestEvent{ID: "async_handle2", Value: 2})
 	wg.Wait()
 
 	if count := atomic.LoadInt32(&processed); count != 2 {
@@ -920,13 +1005,10 @@ func TestSubscribeOnce(t *testing.T) {
 
 	var processed int32
 
-	err := bus.SubscribeOnce("once.test", func(event TestEvent) {
+	mustSubscribe(t, bus, "once.test", func(ctx context.Context, event TestEvent) error {
 		atomic.AddInt32(&processed, 1)
-	})
-
-	if err != nil {
-		t.Errorf("Unexpected error in SubscribeOnce: %v", err)
-	}
+		return nil
+	}, HandlerOnce())
 
 	// Publish first event (should be processed)
 	bus.Publish("once.test", TestEvent{ID: "once1", Value: 1})
@@ -942,7 +1024,7 @@ func TestSubscribeOnce(t *testing.T) {
 
 	// Verify no callback exists for the topic anymore
 	if bus.HasCallback("once.test") {
-		t.Error("Expected no callback after SubscribeOnce execution")
+		t.Error("Expected no callback after HandlerOnce execution")
 	}
 }
 
@@ -953,12 +1035,14 @@ func TestMultipleSubscribeOnceSameTopic(t *testing.T) {
 	var first int32
 	var second int32
 
-	bus.SubscribeOnce("once.multi.test", func(event TestEvent) {
+	mustSubscribe(t, bus, "once.multi.test", func(ctx context.Context, event TestEvent) error {
 		atomic.AddInt32(&first, 1)
-	})
-	bus.SubscribeOnce("once.multi.test", func(event TestEvent) {
+		return nil
+	}, HandlerOnce())
+	mustSubscribe(t, bus, "once.multi.test", func(ctx context.Context, event TestEvent) error {
 		atomic.AddInt32(&second, 1)
-	})
+		return nil
+	}, HandlerOnce())
 
 	bus.Publish("once.multi.test", TestEvent{ID: "once", Value: 1})
 	bus.Publish("once.multi.test", TestEvent{ID: "again", Value: 2})
@@ -978,15 +1062,17 @@ func TestWildcardSubscription(t *testing.T) {
 	var calls []string
 	var mu sync.Mutex
 
-	bus.SubscribeWithPriority("*", func(event TestEvent) {
+	mustSubscribe(t, bus, "*", func(ctx context.Context, event TestEvent) error {
 		mu.Lock()
 		calls = append(calls, "wildcard:"+event.ID)
 		mu.Unlock()
-	}, PriorityHigh)
-	bus.SubscribeWithHandle("orders.created", func(event TestEvent) {
+		return nil
+	}, HandlerPriority(PriorityHigh))
+	mustSubscribe(t, bus, "orders.created", func(ctx context.Context, event TestEvent) error {
 		mu.Lock()
 		calls = append(calls, "topic:"+event.ID)
 		mu.Unlock()
+		return nil
 	})
 
 	bus.Publish("orders.created", TestEvent{ID: "a", Value: 1})
@@ -1008,11 +1094,10 @@ func TestWildcardSubscribeOnce(t *testing.T) {
 	defer bus.Close()
 
 	var count int32
-	if err := bus.SubscribeOnce("*", func(event TestEvent) {
+	mustSubscribe(t, bus, "*", func(ctx context.Context, event TestEvent) error {
 		atomic.AddInt32(&count, 1)
-	}); err != nil {
-		t.Fatalf("Unexpected subscribe error: %v", err)
-	}
+		return nil
+	}, HandlerOnce())
 
 	bus.Publish("first.topic", TestEvent{ID: "first", Value: 1})
 	bus.Publish("second.topic", TestEvent{ID: "second", Value: 2})
@@ -1033,14 +1118,11 @@ func TestSubscribeOnceAsync(t *testing.T) {
 	var processed int32
 	var wg sync.WaitGroup
 
-	err := bus.SubscribeOnceAsync("once.async.test", func(event TestEvent) {
+	mustSubscribe(t, bus, "once.async.test", func(ctx context.Context, event TestEvent) error {
 		atomic.AddInt32(&processed, 1)
 		wg.Done()
-	})
-
-	if err != nil {
-		t.Errorf("Unexpected error in SubscribeOnceAsync: %v", err)
-	}
+		return nil
+	}, HandlerOnce(), HandlerAsync(false))
 
 	// Publish first event (should be processed)
 	wg.Add(1)
@@ -1057,7 +1139,7 @@ func TestSubscribeOnceAsync(t *testing.T) {
 
 	// Verify no callback exists for the topic anymore
 	if bus.HasCallback("once.async.test") {
-		t.Error("Expected no callback after SubscribeOnceAsync execution")
+		t.Error("Expected no callback after once async execution")
 	}
 }
 
@@ -1072,7 +1154,7 @@ func TestHasCallback(t *testing.T) {
 	}
 
 	// Subscribe a handler
-	handle := bus.SubscribeWithHandle("callback.test", func(event TestEvent) {})
+	handle := mustSubscribe(t, bus, "callback.test", discard[TestEvent])
 	defer handle.Unsubscribe()
 
 	// Now should have callback
@@ -1106,9 +1188,9 @@ func TestGetTopics(t *testing.T) {
 	}
 
 	// Subscribe to multiple topics
-	handle1 := bus.SubscribeWithHandle("topic1", func(event TestEvent) {})
-	handle2 := bus.SubscribeWithHandle("topic2", func(event TestEvent) {})
-	handle3 := bus.SubscribeWithHandle("topic3", func(event TestEvent) {})
+	handle1 := mustSubscribe(t, bus, "topic1", discard[TestEvent])
+	handle2 := mustSubscribe(t, bus, "topic2", discard[TestEvent])
+	handle3 := mustSubscribe(t, bus, "topic3", discard[TestEvent])
 
 	defer handle1.Unsubscribe()
 	defer handle2.Unsubscribe()
@@ -1150,23 +1232,21 @@ func TestGetSubscriberCount(t *testing.T) {
 	topic := "subscriber.count.test"
 
 	// Initially no subscribers
-	count := bus.GetSubscriberCount(topic)
-	if count != 0 {
+	if count := bus.GetSubscriberCount(topic); count != 0 {
 		t.Errorf("Expected 0 subscribers initially, got %d", count)
 	}
 
 	// Add subscribers
-	handle1 := bus.SubscribeWithHandle(topic, func(event TestEvent) {})
-	handle2 := bus.SubscribeWithHandle(topic, func(event TestEvent) {})
-	handle3 := bus.SubscribeWithHandle(topic, func(event TestEvent) {})
+	handle1 := mustSubscribe(t, bus, topic, discard[TestEvent])
+	handle2 := mustSubscribe(t, bus, topic, discard[TestEvent])
+	handle3 := mustSubscribe(t, bus, topic, discard[TestEvent])
 
 	defer handle1.Unsubscribe()
 	defer handle2.Unsubscribe()
 	defer handle3.Unsubscribe()
 
 	// Should have 3 subscribers
-	count = bus.GetSubscriberCount(topic)
-	if count != 3 {
+	if count := bus.GetSubscriberCount(topic); count != 3 {
 		t.Errorf("Expected 3 subscribers, got %d", count)
 	}
 
@@ -1174,14 +1254,12 @@ func TestGetSubscriberCount(t *testing.T) {
 	handle1.Unsubscribe()
 
 	// Should have 2 subscribers
-	count = bus.GetSubscriberCount(topic)
-	if count != 2 {
+	if count := bus.GetSubscriberCount(topic); count != 2 {
 		t.Errorf("Expected 2 subscribers after unsubscribe, got %d", count)
 	}
 
 	// Test non-existent topic
-	count = bus.GetSubscriberCount("non.existent.topic")
-	if count != 0 {
+	if count := bus.GetSubscriberCount("non.existent.topic"); count != 0 {
 		t.Errorf("Expected 0 subscribers for non-existent topic, got %d", count)
 	}
 }
@@ -1195,12 +1273,10 @@ func TestEventError(t *testing.T) {
 	}
 
 	errorString := err.Error()
-	expectedSubstring := "event error in topic 'test.topic'"
-	if !contains(errorString, expectedSubstring) {
-		t.Errorf("Expected error string to contain '%s', got '%s'", expectedSubstring, errorString)
+	if !strings.Contains(errorString, "event error in topic 'test.topic'") {
+		t.Errorf("Expected error string to contain the topic, got '%s'", errorString)
 	}
-
-	if !contains(errorString, "test error") {
+	if !strings.Contains(errorString, "test error") {
 		t.Errorf("Expected error string to contain 'test error', got '%s'", errorString)
 	}
 }
@@ -1220,11 +1296,12 @@ func TestAsyncErrorHandling(t *testing.T) {
 	})
 
 	// Subscribe async handler that will panic
-	bus.SubscribeAsync("async.error.test", func(event TestEvent) {
+	mustSubscribe(t, bus, "async.error.test", func(ctx context.Context, event TestEvent) error {
 		if event.Value < 0 {
 			panic("negative value in async handler")
 		}
-	}, false)
+		return nil
+	}, HandlerAsync(false))
 
 	// Publish event that will cause panic
 	wg.Add(1)
@@ -1241,45 +1318,26 @@ func TestClosedBusOperations(t *testing.T) {
 	bus := NewTyped[TestEvent]()
 
 	// Close the bus
-	err := bus.Close()
-	if err != nil {
+	if err := bus.Close(); err != nil {
 		t.Errorf("Unexpected error closing bus: %v", err)
 	}
 
-	// Test Subscribe on closed bus
-	err = bus.Subscribe("closed.test", func(event TestEvent) {})
-	if err == nil {
-		t.Error("Expected error when subscribing to closed bus")
+	// Every subscription shape is rejected with an error and a nil handle.
+	cases := [][]HandlerOption{
+		nil,
+		{HandlerAsync(false)},
+		{HandlerOnce()},
+		{HandlerOnce(), HandlerAsync(false)},
+		{HandlerPriority(PriorityHigh), HandlerSerial()},
 	}
-
-	// Test SubscribeAsync on closed bus
-	err = bus.SubscribeAsync("closed.test", func(event TestEvent) {}, false)
-	if err == nil {
-		t.Error("Expected error when subscribing async to closed bus")
-	}
-
-	// Test SubscribeOnce on closed bus
-	err = bus.SubscribeOnce("closed.test", func(event TestEvent) {})
-	if err == nil {
-		t.Error("Expected error when subscribing once to closed bus")
-	}
-
-	// Test SubscribeOnceAsync on closed bus
-	err = bus.SubscribeOnceAsync("closed.test", func(event TestEvent) {})
-	if err == nil {
-		t.Error("Expected error when subscribing once async to closed bus")
-	}
-
-	// Test doSubscribeWithHandle on closed bus (returns nil)
-	handle := bus.SubscribeWithHandle("closed.test", func(event TestEvent) {})
-	if handle != nil {
-		t.Error("Expected nil handle when subscribing to closed bus")
-	}
-
-	// Test SubscribeAsyncWithHandle on closed bus (returns nil)
-	handle = bus.SubscribeAsyncWithHandle("closed.test", func(event TestEvent) {}, false)
-	if handle != nil {
-		t.Error("Expected nil handle when subscribing async to closed bus")
+	for i, opts := range cases {
+		handle, err := bus.Subscribe("closed.test", discard[TestEvent], opts...)
+		if err == nil {
+			t.Errorf("case %d: expected error when subscribing to closed bus", i)
+		}
+		if handle != nil {
+			t.Errorf("case %d: expected nil handle when subscribing to closed bus", i)
+		}
 	}
 }
 
@@ -1296,29 +1354,12 @@ func TestNilInputsAreIgnoredOrRejected(t *testing.T) {
 	}
 
 	bus.AddMiddleware(nil)
-	if err := bus.Subscribe("nil.fn", nil); err == nil {
+	if _, err := bus.Subscribe("nil.fn", nil); err == nil {
 		t.Fatal("Expected error for nil handler")
 	}
-	if handle := bus.SubscribeWithHandle("nil.fn", nil); handle != nil {
-		t.Fatal("Expected nil handle for nil handler")
-	}
-	if handle := bus.SubscribeWithContext(nil, "nil.ctx", func(event TestEvent) {}); handle == nil {
-		t.Fatal("Expected nil context to default to background context")
+	if handle, err := bus.Subscribe("nil.ctx", discard[TestEvent], HandlerContext(nil)); err != nil || handle == nil {
+		t.Fatalf("Expected nil context to default to background context, got handle=%v err=%v", handle, err)
 	}
 
 	bus.Publish("nil.ctx", TestEvent{ID: "ok", Value: 1})
-}
-
-// Helper function to check if string contains substring
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && (s == substr || len(substr) == 0 ||
-		(len(s) > len(substr) && (s[:len(substr)] == substr || s[len(s)-len(substr):] == substr ||
-			func() bool {
-				for i := 1; i <= len(s)-len(substr); i++ {
-					if s[i:i+len(substr)] == substr {
-						return true
-					}
-				}
-				return false
-			}())))
 }
