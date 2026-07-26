@@ -24,6 +24,11 @@ import "github.com/townbell/bus" // package bus
 
 [中文文档](README_ZH.md)
 
+> **v0.6.0 replaced the subscription API.** One `Subscribe` method with
+> options, handlers of the form `func(ctx, T) error`, and `Publish` returns an
+> error. Coming from v0.5.x? See [MIGRATION.md](MIGRATION.md) — the rewrite is
+> mechanical. This API freezes at v1.0.0; design feedback is welcome now.
+
 ## ✨ Features
 
 ### 🔧 Core Features
@@ -68,7 +73,9 @@ go get github.com/townbell/bus/prometheus
 package main
 
 import (
+    "context"
     "fmt"
+
     "github.com/townbell/bus"
 )
 
@@ -83,12 +90,17 @@ func main() {
     defer eventBus.Close()
 
     // Subscribe to events
-    handle := eventBus.SubscribeWithHandle("user.login", func(event UserEvent) {
+    handle, err := eventBus.Subscribe("user.login", func(ctx context.Context, event UserEvent) error {
         fmt.Printf("User %s performed %s\n", event.UserID, event.Action)
+        return nil
     })
+    if err != nil {
+        panic(err)
+    }
     defer handle.Unsubscribe()
 
-    // Publish events
+    // Publish events. The returned error joins any synchronous handler
+    // failures and is safe to ignore when they do not matter to the caller.
     eventBus.Publish("user.login", UserEvent{
         UserID: "user123",
         Action: "login",
@@ -104,19 +116,22 @@ Handlers with different priorities execute in priority order:
 
 ```go
 // High priority - security checks
-securityHandle := eventBus.SubscribeWithPriority("user.action", func(event UserEvent) {
+securityHandle, _ := eventBus.Subscribe("user.action", func(ctx context.Context, event UserEvent) error {
     fmt.Println("🔒 Security check")
-}, bus.PriorityCritical)
+    return nil
+}, bus.HandlerPriority(bus.PriorityCritical))
 
 // Normal priority - business logic
-businessHandle := eventBus.SubscribeWithPriority("user.action", func(event UserEvent) {
+businessHandle, _ := eventBus.Subscribe("user.action", func(ctx context.Context, event UserEvent) error {
     fmt.Println("📋 Business processing")
-}, bus.PriorityNormal)
+    return nil
+}, bus.HandlerPriority(bus.PriorityNormal))
 
 // Low priority - analytics
-analyticsHandle := eventBus.SubscribeWithPriority("user.action", func(event UserEvent) {
+analyticsHandle, _ := eventBus.Subscribe("user.action", func(ctx context.Context, event UserEvent) error {
     fmt.Println("📊 Analytics")
-}, bus.PriorityLow)
+    return nil
+}, bus.HandlerPriority(bus.PriorityLow))
 ```
 
 ### Event Filtering
@@ -125,16 +140,18 @@ Process only events that match specific criteria:
 
 ```go
 // Only process admin user events
-adminHandle := eventBus.SubscribeWithFilter("user.action", func(event UserEvent) {
+adminHandle, _ := eventBus.Subscribe("user.action", func(ctx context.Context, event UserEvent) error {
     fmt.Printf("Admin action: %s\n", event.UserID)
-}, func(topic string, event UserEvent) bool {
+    return nil
+}, bus.HandlerFilter(func(topic string, event UserEvent) bool {
     return strings.HasPrefix(event.UserID, "admin_")
-})
+}))
 
 // Only process sensitive operations
-sensitiveHandle := eventBus.SubscribeWithFilter("user.action", func(event UserEvent) {
+sensitiveHandle, _ := eventBus.Subscribe("user.action", func(ctx context.Context, event UserEvent) error {
     fmt.Printf("Sensitive operation alert: %s\n", event.Action)
-}, func(topic string, event UserEvent) bool {
+    return nil
+}, bus.HandlerFilter(func(topic string, event UserEvent) bool {
     sensitiveActions := []string{"delete", "modify_permissions"}
     for _, action := range sensitiveActions {
         if event.Action == action {
@@ -142,7 +159,7 @@ sensitiveHandle := eventBus.SubscribeWithFilter("user.action", func(event UserEv
         }
     }
     return false
-})
+}))
 ```
 
 ### Context Control
@@ -150,16 +167,18 @@ sensitiveHandle := eventBus.SubscribeWithFilter("user.action", func(event UserEv
 Use context for cancellation and timeout control:
 
 ```go
-// Context cancellation
+// Context cancellation: canceling the subscription context disables the handler
 ctx, cancel := context.WithCancel(context.Background())
-handle := eventBus.SubscribeWithContext(ctx, "user.session", func(event UserEvent) {
+handle, _ := eventBus.Subscribe("user.session", func(ctx context.Context, event UserEvent) error {
     fmt.Printf("Session event: %s\n", event.UserID)
-})
+    return nil
+}, bus.HandlerContext(ctx))
 
 // Cancel subscription
 cancel()
 
-// Timeout publishing
+// Timeout publishing. The handler's ctx is canceled when the deadline passes,
+// so a cooperative handler can stop early instead of running to completion.
 err := eventBus.PublishWithTimeout("user.action", event, 5*time.Second)
 if err != nil {
     fmt.Printf("Publish timeout: %v\n", err)
@@ -168,7 +187,25 @@ if err != nil {
 
 ### Error Handling
 
-Set up global error handler:
+Handlers report business failures by returning an error. The failure is
+counted in metrics, reported to the global `ErrorHandler`, and joined into the
+publish call's return value — dispatch to the remaining handlers continues:
+
+```go
+eventBus.Subscribe("order.created", func(ctx context.Context, event OrderEvent) error {
+    if err := reserveStock(ctx, event); err != nil {
+        return fmt.Errorf("reserve stock: %w", err)
+    }
+    return nil
+})
+
+if err := eventBus.Publish("order.created", order); err != nil {
+    log.Printf("delivery failures: %v", err) // errors.Is sees through the join
+}
+```
+
+Set up a global error handler to observe every failure, including those from
+asynchronous handlers (whose errors never reach the publish return value):
 
 ```go
 eventBus.SetErrorHandler(func(err *bus.EventError) {
@@ -246,41 +283,48 @@ eventBus := bus.NewTyped[UserEvent](
 
 ```go
 // Async processing, non-transactional (concurrent execution)
-err := eventBus.SubscribeAsync("user.notification", func(event UserEvent) {
-    sendEmail(event.UserID)
-}, false)
+_, err := eventBus.Subscribe("user.notification", func(ctx context.Context, event UserEvent) error {
+    return sendEmail(ctx, event.UserID)
+}, bus.HandlerAsync(false))
 
 // Async processing, transactional (serial execution)
-err := eventBus.SubscribeAsync("user.audit", func(event UserEvent) {
-    writeAuditLog(event)
-}, true)
+_, err = eventBus.Subscribe("user.audit", func(ctx context.Context, event UserEvent) error {
+    return writeAuditLog(ctx, event)
+}, bus.HandlerAsync(true))
 ```
 
 ### Handler Execution Control
 
-`SubscribeWithOptions` adds handler-level controls without changing the existing simple APIs:
+Every subscription concern is a `HandlerOption`, and they compose freely in
+one `Subscribe` call:
 
 ```go
-handle, err := eventBus.SubscribeWithOptions("payment.validate", func(event PaymentEvent) {
-    validatePayment(event)
-},
-    bus.HandlerTimeout(2*time.Second),
-    bus.HandlerRecoverPolicy(bus.RecoverAndStop),
-    bus.HandlerSerial(),
+handle, err := eventBus.Subscribe("payment.validate",
+    func(ctx context.Context, event PaymentEvent) error {
+        return validatePayment(ctx, event)
+    },
+    bus.HandlerTimeout(2*time.Second),           // cancels ctx when it elapses
+    bus.HandlerRecoverPolicy(bus.RecoverAndStop), // a panic aborts the publish
+    bus.HandlerSerial(),                          // one execution at a time
     bus.HandlerPriority(bus.PriorityHigh),
 )
 ```
 
+Available options: `HandlerPriority`, `HandlerFilter`, `HandlerContext`,
+`HandlerAsync`, `HandlerOnce`, `HandlerTimeout`, `HandlerRecoverPolicy`,
+`HandlerMaxConcurrency`, `HandlerSerial`.
+
 ## ✅ Behavior Contract
 
-- `Publish` ignores returned errors; use `PublishWithContext` or `PublishWithTimeout` when cancellation, timeout, or closed-bus errors matter.
-- Synchronous handlers run in the current goroutine by default; asynchronous handlers run in separate goroutines, and `transactional=true` serializes calls to the same handler.
-- Handler timeouts bound how long the publish call waits; they do not forcibly stop a handler that has already started running.
-- Handler panics are recovered by default, failed metrics are incremented, and the error is reported through `ErrorHandler`; `RecoverAndStop` makes a recovered panic stop the current publish call.
+- `Publish` and `PublishWithContext` return the joined failures of the synchronous handlers (`errors.Is` sees through the join). The error is safe to ignore. Asynchronous handler failures are reported through `ErrorHandler` only, because the publish call may return before they run.
+- A handler error does not stop dispatch: the remaining handlers still run. Dispatch stops early only when the publish context is canceled, the bus closes, or a handler panics under `RecoverAndStop`.
+- Synchronous handlers run in the goroutine that calls publish and receive a context derived from the publish call; asynchronous handlers run in separate goroutines and receive the subscription context (`HandlerContext`), and `HandlerAsync(true)` serializes calls to the same handler.
+- `HandlerTimeout` bounds how long the publish call waits and cancels the handler's context when it elapses; a handler that ignores its context keeps running in the background and is still awaited by `WaitAsync` and `Close`.
+- Handler panics are recovered, counted as failures, and reported through `ErrorHandler`; `RecoverAndContinue` (the default) keeps dispatching, `RecoverAndStop` aborts the publish call. Either way the recovered panic appears in the publish error.
 - Middleware must call `next()` to continue to the next middleware and handlers; skipping `next()` intercepts the event.
-- `SubscribeOnce` / `SubscribeOnceAsync` handlers execute successfully at most once, including when multiple one-time handlers share a topic.
+- `HandlerOnce` handlers execute successfully at most once, including when multiple one-time handlers share a topic.
 - After `Close`, the bus rejects new publish and subscribe calls; already-started async handlers are allowed to finish.
-- Subscribe helpers that return only a `*Handle[T]` yield `nil` when the subscription is rejected (nil callback, or a closed bus). A `nil` handle is safe to use: `Unsubscribe` returns an error and `IsActive` returns `false`, so a deferred `Unsubscribe` never panics. Use `SubscribeWithOptions` when you want the rejection reason.
+- `Subscribe` returns `(nil, error)` when the subscription is rejected (nil callback, mismatched filter type, or a closed bus). A `nil` handle is safe to use: `Unsubscribe` returns an error and `IsActive` returns `false`, so ignoring the error and deferring `Unsubscribe` never panics.
 
 ## 🗺️ RoadMap
 
@@ -296,9 +340,9 @@ Townbell will keep its focus on being an in-process, type-safe, lightweight even
 | P1 | Done | Continuous integration | GitHub Actions runs build, vet, race tests, a gofmt gate and a coverage floor across a Go version matrix, and vets `example/` explicitly |
 | P1 | Done | Dependency-free core | The Prometheus adapter moved into its own module, so importing `bus` pulls in nothing but the standard library |
 | P1 | Done | Runnable documentation | Godoc `Example` functions execute in CI with verified output and render on pkg.go.dev |
-| P0 | Planned | Subscription API convergence | Three different shapes coexist today: `error` only, `*Handle[T]` only, and `(*Handle[T], error)`. Converge on the last one. Breaking, so it gates v1.0.0 |
-| P0 | Planned | Handler error reporting | Handlers are `func(T)` and cannot report a business failure except by panicking, so `ErrorHandler` only ever sees panics and timeouts. Breaking, gates v1.0.0, and unblocks result collection |
-| P0 | Planned | `Publish` error semantics | Decide whether `Publish` returns an error or whether discarding it becomes a permanent contract. Gates v1.0.0 |
+| P0 | Preview (v0.6.0) | Subscription API convergence | One `Subscribe(topic, fn, opts...) (*Handle[T], error)` replaced the ten previous variants. Freezes at v1.0.0 |
+| P0 | Preview (v0.6.0) | Handler error reporting | Handlers are `func(ctx, T) error`: business failures reach metrics, the `ErrorHandler`, and the publish return value without panicking. Unblocks result collection. Freezes at v1.0.0 |
+| P0 | Preview (v0.6.0) | `Publish` error semantics | `Publish` returns the joined synchronous-handler failures; ignoring it stays legal. Freezes at v1.0.0 |
 | P2 | Planned | Result collection | Borrow from Blinker and add a `PublishCollect`-style API for collecting handler results or errors |
 | P2 | Partial | Topic enhancements | Wildcard (`*`) topics are implemented; hierarchical topics and no-subscriber hooks are still planned |
 | P2 | Planned | Integration examples | Add practical examples for `net/http`, Gin, CLI apps, and workers |
@@ -323,16 +367,12 @@ The library is organized into separate modules for better maintainability:
 ```go
 // Subscriber interface
 type BusSubscriber[T any] interface {
-    Subscribe(topic string, fn func(T)) error
-    SubscribeWithPriority(topic string, fn func(T), priority Priority) *Handle[T]
-    SubscribeWithFilter(topic string, fn func(T), filter EventFilter[T]) *Handle[T]
-    SubscribeWithContext(ctx context.Context, topic string, fn func(T)) *Handle[T]
-    // ...
+    Subscribe(topic string, fn Handler[T], options ...HandlerOption) (*Handle[T], error)
 }
 
 // Publisher interface
 type BusPublisher[T any] interface {
-    Publish(topic string, event T)
+    Publish(topic string, event T) error
     PublishWithContext(ctx context.Context, topic string, event T) error
     PublishWithTimeout(topic string, event T, timeout time.Duration) error
 }
@@ -350,6 +390,9 @@ type BusController interface {
 ### Type System
 
 ```go
+// Event handler
+type Handler[T any] func(ctx context.Context, event T) error
+
 // Event filter
 type EventFilter[T any] func(topic string, event T) bool
 
@@ -437,21 +480,20 @@ eventBus.SetErrorHandler(func(err *EventError) {
 
 ```go
 // Use async for non-critical paths
-eventBus.SubscribeAsync("analytics.track", func(event UserEvent) {
-    // Non-critical analytics
-    analytics.Track(event)
-}, false)
+eventBus.Subscribe("analytics.track", func(ctx context.Context, event UserEvent) error {
+    return analytics.Track(ctx, event) // Non-critical analytics
+}, bus.HandlerAsync(false))
 
 // Use sync for critical paths
-eventBus.Subscribe("payment.validate", func(event PaymentEvent) {
-    // Critical payment validation
-    validatePayment(event)
+eventBus.Subscribe("payment.validate", func(ctx context.Context, event PaymentEvent) error {
+    return validatePayment(ctx, event) // Critical payment validation
 })
 
 // Use filters to reduce unnecessary processing
-eventBus.SubscribeWithFilter("user.activity", handler, func(topic string, event UserEvent) bool {
-    return event.IsImportant() // Only process important events
-})
+eventBus.Subscribe("user.activity", handler, bus.HandlerFilter(
+    func(topic string, event UserEvent) bool {
+        return event.IsImportant() // Only process important events
+    }))
 ```
 
 ## 🔍 Comparison with Other Libraries

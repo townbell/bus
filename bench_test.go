@@ -1,6 +1,7 @@
 package bus
 
 import (
+	"context"
 	"sync"
 	"testing"
 )
@@ -10,14 +11,17 @@ type BenchEvent struct {
 	Data string
 }
 
+func benchHandler(ctx context.Context, event BenchEvent) error {
+	// Simple processing
+	_ = event.ID * 2
+	return nil
+}
+
 func BenchmarkSyncPublish(b *testing.B) {
 	bus := NewTyped[BenchEvent]()
 	defer bus.Close()
 
-	bus.SubscribeWithHandle("bench.sync", func(event BenchEvent) {
-		// Simple processing
-		_ = event.ID * 2
-	})
+	mustSubscribe(b, bus, "bench.sync", benchHandler)
 
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
@@ -36,10 +40,7 @@ func BenchmarkAsyncPublish(b *testing.B) {
 	bus := NewTyped[BenchEvent]()
 	defer bus.Close()
 
-	bus.SubscribeAsync("bench.async", func(event BenchEvent) {
-		// Simple processing
-		_ = event.ID * 2
-	}, false)
+	mustSubscribe(b, bus, "bench.async", benchHandler, HandlerAsync(false))
 
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
@@ -63,9 +64,7 @@ func BenchmarkMultipleSubscribers(b *testing.B) {
 	// Create multiple subscribers
 	numSubscribers := 10
 	for i := 0; i < numSubscribers; i++ {
-		bus.SubscribeWithHandle("bench.multi", func(event BenchEvent) {
-			_ = event.ID * 2
-		})
+		mustSubscribe(b, bus, "bench.multi", benchHandler)
 	}
 
 	b.ResetTimer()
@@ -86,17 +85,9 @@ func BenchmarkWithPriority(b *testing.B) {
 	defer bus.Close()
 
 	// Subscribers with different priorities
-	bus.SubscribeWithPriority("bench.priority", func(event BenchEvent) {
-		_ = event.ID * 2
-	}, PriorityCritical)
-
-	bus.SubscribeWithPriority("bench.priority", func(event BenchEvent) {
-		_ = event.ID * 3
-	}, PriorityNormal)
-
-	bus.SubscribeWithPriority("bench.priority", func(event BenchEvent) {
-		_ = event.ID * 4
-	}, PriorityLow)
+	mustSubscribe(b, bus, "bench.priority", benchHandler, HandlerPriority(PriorityCritical))
+	mustSubscribe(b, bus, "bench.priority", benchHandler, HandlerPriority(PriorityNormal))
+	mustSubscribe(b, bus, "bench.priority", benchHandler, HandlerPriority(PriorityLow))
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -112,11 +103,10 @@ func BenchmarkWithFilter(b *testing.B) {
 	defer bus.Close()
 
 	// Filter only processes even IDs
-	bus.SubscribeWithFilter("bench.filter", func(event BenchEvent) {
-		_ = event.ID * 2
-	}, func(topic string, event BenchEvent) bool {
-		return event.ID%2 == 0
-	})
+	mustSubscribe(b, bus, "bench.filter", benchHandler,
+		HandlerFilter(func(topic string, event BenchEvent) bool {
+			return event.ID%2 == 0
+		}))
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -133,9 +123,11 @@ func BenchmarkConcurrentSubscribeUnsubscribe(b *testing.B) {
 
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			handle := bus.SubscribeWithHandle("bench.concurrent", func(event BenchEvent) {
-				_ = event.ID * 2
-			})
+			handle, err := bus.Subscribe("bench.concurrent", benchHandler)
+			if err != nil {
+				b.Error(err)
+				return
+			}
 
 			// Publish an event
 			bus.Publish("bench.concurrent", BenchEvent{
@@ -153,8 +145,9 @@ func BenchmarkMemoryUsage(b *testing.B) {
 	bus := NewTyped[BenchEvent]()
 	defer bus.Close()
 
-	bus.SubscribeWithHandle("bench.memory", func(event BenchEvent) {
+	mustSubscribe(b, bus, "bench.memory", func(ctx context.Context, event BenchEvent) error {
 		// Minimal processing
+		return nil
 	})
 
 	b.ResetTimer()

@@ -5,23 +5,26 @@ import (
 	"testing"
 )
 
-// The Subscribe helpers that return only a handle yield nil when the
-// subscription is rejected. A deferred Unsubscribe on that nil handle must
-// report an error instead of panicking.
+// Ignoring the error from Subscribe leaves a nil handle. A deferred
+// Unsubscribe on that nil handle must report an error instead of panicking.
 func TestNilHandleIsSafe(t *testing.T) {
 	closed := NewTyped[string]()
 	if err := closed.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
 
+	subscribe := func(b *EventBus[string], fn Handler[string], opts ...HandlerOption) *Handle[string] {
+		handle, _ := b.Subscribe("topic", fn, opts...)
+		return handle
+	}
+
 	cases := map[string]*Handle[string]{
-		"closed bus, SubscribeWithHandle":   closed.SubscribeWithHandle("topic", func(string) {}),
-		"closed bus, SubscribeWithPriority": closed.SubscribeWithPriority("topic", func(string) {}, PriorityHigh),
-		"closed bus, SubscribeWithFilter": closed.SubscribeWithFilter("topic", func(string) {}, func(string, string) bool {
-			return true
-		}),
-		"closed bus, SubscribeWithContext": closed.SubscribeWithContext(context.Background(), "topic", func(string) {}),
-		"nil callback":                     NewTyped[string]().SubscribeWithHandle("topic", nil),
+		"closed bus":               subscribe(closed, discard[string]),
+		"closed bus with priority": subscribe(closed, discard[string], HandlerPriority(PriorityHigh)),
+		"closed bus with context":  subscribe(closed, discard[string], HandlerContext(context.Background())),
+		"nil callback":             subscribe(NewTyped[string](), nil),
+		"filter type mismatch": subscribe(NewTyped[string](), discard[string],
+			HandlerFilter(func(topic string, event int) bool { return true })),
 	}
 
 	for name, handle := range cases {
@@ -50,10 +53,7 @@ func TestHandleUnsubscribeIsIdempotent(t *testing.T) {
 	b := NewTyped[string]()
 	defer b.Close()
 
-	handle := b.SubscribeWithHandle("topic", func(string) {})
-	if handle == nil {
-		t.Fatal("expected a handle")
-	}
+	handle := mustSubscribe(t, b, "topic", discard[string])
 	if !handle.IsActive() {
 		t.Fatal("fresh handle should be active")
 	}

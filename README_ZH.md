@@ -24,6 +24,11 @@ import "github.com/townbell/bus" // 包名为 bus
 
 [English Documentation](README.md)
 
+> **v0.6.0 替换了订阅 API。** 一个带选项的 `Subscribe`、形如 `func(ctx, T) error`
+> 的 handler、返回 error 的 `Publish`。从 v0.5.x 升级请看
+> [MIGRATION_ZH.md](MIGRATION_ZH.md)——改写是机械性的。这套 API 将在 v1.0.0
+> 冻结，现在正是提设计反馈的时候。
+
 ## ✨ 特性
 
 ### 🔧 核心功能
@@ -67,7 +72,9 @@ go get github.com/townbell/bus/prometheus
 package main
 
 import (
+    "context"
     "fmt"
+
     "github.com/townbell/bus"
 )
 
@@ -82,12 +89,16 @@ func main() {
     defer eventBus.Close()
 
     // 订阅事件
-    handle := eventBus.SubscribeWithHandle("user.login", func(event UserEvent) {
+    handle, err := eventBus.Subscribe("user.login", func(ctx context.Context, event UserEvent) error {
         fmt.Printf("用户 %s 执行了 %s\n", event.UserID, event.Action)
+        return nil
     })
+    if err != nil {
+        panic(err)
+    }
     defer handle.Unsubscribe()
 
-    // 发布事件
+    // 发布事件。返回值合并了同步 handler 的失败，不关心时可以直接忽略。
     eventBus.Publish("user.login", UserEvent{
         UserID: "user123",
         Action: "login",
@@ -103,19 +114,22 @@ func main() {
 
 ```go
 // 高优先级 - 安全检查
-securityHandle := eventBus.SubscribeWithPriority("user.action", func(event UserEvent) {
+securityHandle, _ := eventBus.Subscribe("user.action", func(ctx context.Context, event UserEvent) error {
     fmt.Println("🔒 安全检查")
-}, bus.PriorityCritical)
+    return nil
+}, bus.HandlerPriority(bus.PriorityCritical))
 
 // 普通优先级 - 业务逻辑
-businessHandle := eventBus.SubscribeWithPriority("user.action", func(event UserEvent) {
+businessHandle, _ := eventBus.Subscribe("user.action", func(ctx context.Context, event UserEvent) error {
     fmt.Println("📋 业务处理")
-}, bus.PriorityNormal)
+    return nil
+}, bus.HandlerPriority(bus.PriorityNormal))
 
 // 低优先级 - 统计分析
-analyticsHandle := eventBus.SubscribeWithPriority("user.action", func(event UserEvent) {
+analyticsHandle, _ := eventBus.Subscribe("user.action", func(ctx context.Context, event UserEvent) error {
     fmt.Println("📊 数据统计")
-}, bus.PriorityLow)
+    return nil
+}, bus.HandlerPriority(bus.PriorityLow))
 ```
 
 ### 事件过滤
@@ -124,16 +138,18 @@ analyticsHandle := eventBus.SubscribeWithPriority("user.action", func(event User
 
 ```go
 // 只处理管理员用户的事件
-adminHandle := eventBus.SubscribeWithFilter("user.action", func(event UserEvent) {
+adminHandle, _ := eventBus.Subscribe("user.action", func(ctx context.Context, event UserEvent) error {
     fmt.Printf("管理员操作: %s\n", event.UserID)
-}, func(topic string, event UserEvent) bool {
+    return nil
+}, bus.HandlerFilter(func(topic string, event UserEvent) bool {
     return strings.HasPrefix(event.UserID, "admin_")
-})
+}))
 
 // 只处理敏感操作
-sensitiveHandle := eventBus.SubscribeWithFilter("user.action", func(event UserEvent) {
+sensitiveHandle, _ := eventBus.Subscribe("user.action", func(ctx context.Context, event UserEvent) error {
     fmt.Printf("敏感操作告警: %s\n", event.Action)
-}, func(topic string, event UserEvent) bool {
+    return nil
+}, bus.HandlerFilter(func(topic string, event UserEvent) bool {
     sensitiveActions := []string{"delete", "modify_permissions"}
     for _, action := range sensitiveActions {
         if event.Action == action {
@@ -141,7 +157,7 @@ sensitiveHandle := eventBus.SubscribeWithFilter("user.action", func(event UserEv
         }
     }
     return false
-})
+}))
 ```
 
 ### 上下文控制
@@ -149,16 +165,18 @@ sensitiveHandle := eventBus.SubscribeWithFilter("user.action", func(event UserEv
 使用 context 进行取消和超时控制：
 
 ```go
-// 上下文取消
+// 上下文取消：取消订阅 context 会停用该 handler
 ctx, cancel := context.WithCancel(context.Background())
-handle := eventBus.SubscribeWithContext(ctx, "user.session", func(event UserEvent) {
+handle, _ := eventBus.Subscribe("user.session", func(ctx context.Context, event UserEvent) error {
     fmt.Printf("会话事件: %s\n", event.UserID)
-})
+    return nil
+}, bus.HandlerContext(ctx))
 
 // 取消订阅
 cancel()
 
-// 超时发布
+// 超时发布。截止时间一到，handler 的 ctx 会被取消，
+// 配合的 handler 可以提前停止，而不是继续跑完。
 err := eventBus.PublishWithTimeout("user.action", event, 5*time.Second)
 if err != nil {
     fmt.Printf("发布超时: %v\n", err)
@@ -167,7 +185,24 @@ if err != nil {
 
 ### 错误处理
 
-设置全局错误处理器：
+handler 通过返回 error 上报业务失败。失败会计入指标、上报给全局 `ErrorHandler`，
+并合并进发布调用的返回值——对后续 handler 的派发继续进行：
+
+```go
+eventBus.Subscribe("order.created", func(ctx context.Context, event OrderEvent) error {
+    if err := reserveStock(ctx, event); err != nil {
+        return fmt.Errorf("预留库存: %w", err)
+    }
+    return nil
+})
+
+if err := eventBus.Publish("order.created", order); err != nil {
+    log.Printf("投递失败: %v", err) // errors.Is 可以穿透合并后的错误
+}
+```
+
+设置全局错误处理器可以观察到全部失败，包括异步 handler 的
+（它们的错误不会出现在发布调用的返回值里）：
 
 ```go
 eventBus.SetErrorHandler(func(err *bus.EventError) {
@@ -245,41 +280,47 @@ eventBus := bus.NewTyped[UserEvent](
 
 ```go
 // 异步处理，非事务性（并发执行）
-err := eventBus.SubscribeAsync("user.notification", func(event UserEvent) {
-    sendEmail(event.UserID)
-}, false)
+_, err := eventBus.Subscribe("user.notification", func(ctx context.Context, event UserEvent) error {
+    return sendEmail(ctx, event.UserID)
+}, bus.HandlerAsync(false))
 
 // 异步处理，事务性（串行执行）
-err := eventBus.SubscribeAsync("user.audit", func(event UserEvent) {
-    writeAuditLog(event)
-}, true)
+_, err = eventBus.Subscribe("user.audit", func(ctx context.Context, event UserEvent) error {
+    return writeAuditLog(ctx, event)
+}, bus.HandlerAsync(true))
 ```
 
 ### Handler 执行控制
 
-`SubscribeWithOptions` 可以为单个 handler 设置 timeout、recover 策略和并发控制：
+所有订阅关注点都是 `HandlerOption`，可以在一次 `Subscribe` 调用中自由组合：
 
 ```go
-handle, err := eventBus.SubscribeWithOptions("payment.validate", func(event PaymentEvent) {
-    validatePayment(event)
-},
-    bus.HandlerTimeout(2*time.Second),
-    bus.HandlerRecoverPolicy(bus.RecoverAndStop),
-    bus.HandlerSerial(),
+handle, err := eventBus.Subscribe("payment.validate",
+    func(ctx context.Context, event PaymentEvent) error {
+        return validatePayment(ctx, event)
+    },
+    bus.HandlerTimeout(2*time.Second),            // 超时到达时取消 ctx
+    bus.HandlerRecoverPolicy(bus.RecoverAndStop), // panic 中止本次发布
+    bus.HandlerSerial(),                          // 同一时间只执行一个
     bus.HandlerPriority(bus.PriorityHigh),
 )
 ```
 
+可用选项：`HandlerPriority`、`HandlerFilter`、`HandlerContext`、`HandlerAsync`、
+`HandlerOnce`、`HandlerTimeout`、`HandlerRecoverPolicy`、`HandlerMaxConcurrency`、
+`HandlerSerial`。
+
 ## ✅ 行为约定
 
-- `Publish` 会忽略返回错误；需要感知取消、超时或关闭错误时，请使用 `PublishWithContext` 或 `PublishWithTimeout`。
-- 同步 handler 默认在当前 goroutine 执行；异步 handler 会在独立 goroutine 执行，`transactional=true` 时同一 handler 串行执行。
-- handler timeout 限制的是发布调用等待时间，不会强制终止已经开始运行的 handler。
-- handler panic 默认会被恢复，失败计数会增加，并通过 `ErrorHandler` 上报；`RecoverAndStop` 会让已恢复的 panic 停止当前发布流程。
+- `Publish` 和 `PublishWithContext` 返回同步 handler 的失败合并（`errors.Is` 可以穿透）。这个错误可以安全忽略。异步 handler 的失败只通过 `ErrorHandler` 上报，因为发布调用可能在它们运行前就已返回。
+- handler 返回错误不会中断派发：后续 handler 照常执行。只有发布 context 被取消、总线关闭、或 handler 在 `RecoverAndStop` 策略下 panic 时才会提前终止派发。
+- 同步 handler 在调用发布的 goroutine 中执行，收到从发布调用派生的 context；异步 handler 在独立 goroutine 中执行，收到订阅 context（`HandlerContext`），`HandlerAsync(true)` 时同一 handler 串行执行。
+- `HandlerTimeout` 限制发布调用的等待时间，并在超时到达时取消 handler 的 context；无视 context 的 handler 会继续在后台运行，仍会被 `WaitAsync` 和 `Close` 等待。
+- handler panic 会被恢复、计入失败并通过 `ErrorHandler` 上报；`RecoverAndContinue`（默认）继续派发，`RecoverAndStop` 中止本次发布。两种情况下恢复的 panic 都会出现在发布错误里。
 - middleware 必须调用 `next()` 才会继续执行后续 middleware 和 handler；不调用 `next()` 可用于拦截事件。
-- `SubscribeOnce` / `SubscribeOnceAsync` 的 handler 只会成功执行一次，即使同一 topic 下有多个一次性 handler。
+- `HandlerOnce` 的 handler 只会成功执行一次，即使同一 topic 下有多个一次性 handler。
 - `Close` 后不再接受新发布或订阅；已启动的异步 handler 会在关闭流程中等待完成。
-- 只返回 `*Handle[T]` 的订阅方法在订阅被拒绝时（callback 为 nil，或 bus 已关闭）会返回 `nil`。`nil` handle 可以安全使用：`Unsubscribe` 返回错误、`IsActive` 返回 `false`，因此 `defer handle.Unsubscribe()` 不会 panic。需要知道拒绝原因时请用 `SubscribeWithOptions`。
+- 订阅被拒绝时（callback 为 nil、filter 类型不匹配、或总线已关闭），`Subscribe` 返回 `(nil, error)`。`nil` handle 可以安全使用：`Unsubscribe` 返回错误、`IsActive` 返回 `false`，因此忽略错误后 `defer handle.Unsubscribe()` 也不会 panic。
 
 ## 🗺️ RoadMap
 
@@ -295,9 +336,9 @@ Townbell 会优先保持“进程内、类型安全、轻量事件总线”的�
 | P1 | 已完成 | 持续集成 | GitHub Actions 在 Go 版本矩阵上执行 build、vet、race 测试、gofmt 门禁和覆盖率下限，并显式 vet `example/` |
 | P1 | 已完成 | 核心零依赖 | Prometheus 适配器拆为独立模块，引入 `bus` 只会带进标准库 |
 | P1 | 已完成 | 可执行文档 | godoc `Example` 函数在 CI 中带输出校验执行，并展示在 pkg.go.dev 上 |
-| P0 | 未完成 | 订阅 API 收敛 | 目前并存三种签名：只返回 `error`、只返回 `*Handle[T]`、返回 `(*Handle[T], error)`。应统一到最后一种。属破坏性变更，是 v1.0.0 的前置条件 |
-| P0 | 未完成 | handler 错误上报 | handler 是 `func(T)`，业务失败除了 panic 无法上报，导致 `ErrorHandler` 实际只能收到 panic 和 timeout。属破坏性变更，是 v1.0.0 的前置条件，同时解锁返回值收集 |
-| P0 | 未完成 | `Publish` 错误语义 | 定案 `Publish` 是返回 error，还是把"丢弃错误"确立为永久契约。v1.0.0 的前置条件 |
+| P0 | 试运行（v0.6.0） | 订阅 API 收敛 | 一个 `Subscribe(topic, fn, opts...) (*Handle[T], error)` 取代了此前的十个变体。将在 v1.0.0 冻结 |
+| P0 | 试运行（v0.6.0） | handler 错误上报 | handler 变为 `func(ctx, T) error`：业务失败无需 panic 即可进入指标、`ErrorHandler` 和发布返回值。解锁返回值收集。将在 v1.0.0 冻结 |
+| P0 | 试运行（v0.6.0） | `Publish` 错误语义 | `Publish` 返回同步 handler 失败的合并；忽略它依然合法。将在 v1.0.0 冻结 |
 | P2 | 未完成 | 返回值收集 | 参考 Blinker，提供 `PublishCollect` 一类 API，收集多个 handler 的返回值或错误 |
 | P2 | 部分完成 | Topic 增强 | 通配符（`*`）topic 已实现；层级 topic、无订阅者事件 hook 仍待开发 |
 | P2 | 未完成 | 集成示例 | 补充 `net/http`、Gin、CLI、worker 等实际项目中的使用方式 |
@@ -322,16 +363,12 @@ Townbell 会优先保持“进程内、类型安全、轻量事件总线”的�
 ```go
 // 订阅者接口
 type BusSubscriber[T any] interface {
-    Subscribe(topic string, fn func(T)) error
-    SubscribeWithPriority(topic string, fn func(T), priority Priority) *Handle[T]
-    SubscribeWithFilter(topic string, fn func(T), filter EventFilter[T]) *Handle[T]
-    SubscribeWithContext(ctx context.Context, topic string, fn func(T)) *Handle[T]
-    // ...
+    Subscribe(topic string, fn Handler[T], options ...HandlerOption) (*Handle[T], error)
 }
 
 // 发布者接口
 type BusPublisher[T any] interface {
-    Publish(topic string, event T)
+    Publish(topic string, event T) error
     PublishWithContext(ctx context.Context, topic string, event T) error
     PublishWithTimeout(topic string, event T, timeout time.Duration) error
 }
@@ -349,6 +386,9 @@ type BusController interface {
 ### 类型系统
 
 ```go
+// 事件处理器
+type Handler[T any] func(ctx context.Context, event T) error
+
 // 事件过滤器
 type EventFilter[T any] func(topic string, event T) bool
 
@@ -436,21 +476,20 @@ eventBus.SetErrorHandler(func(err *EventError) {
 
 ```go
 // 使用异步处理非关键路径
-eventBus.SubscribeAsync("analytics.track", func(event UserEvent) {
-    // 非关键的数据统计
-    analytics.Track(event)
-}, false)
+eventBus.Subscribe("analytics.track", func(ctx context.Context, event UserEvent) error {
+    return analytics.Track(ctx, event) // 非关键的数据统计
+}, bus.HandlerAsync(false))
 
 // 关键路径使用同步处理
-eventBus.Subscribe("payment.validate", func(event PaymentEvent) {
-    // 关键的支付验证
-    validatePayment(event)
+eventBus.Subscribe("payment.validate", func(ctx context.Context, event PaymentEvent) error {
+    return validatePayment(ctx, event) // 关键的支付验证
 })
 
 // 使用过滤器减少不必要的处理
-eventBus.SubscribeWithFilter("user.activity", handler, func(topic string, event UserEvent) bool {
-    return event.IsImportant() // 只处理重要事件
-})
+eventBus.Subscribe("user.activity", handler, bus.HandlerFilter(
+    func(topic string, event UserEvent) bool {
+        return event.IsImportant() // 只处理重要事件
+    }))
 ```
 
 ## 🔍 与其他库的对比

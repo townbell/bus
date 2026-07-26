@@ -20,15 +20,6 @@ type UserEvent struct {
 	Data      map[string]interface{} `json:"data"`
 }
 
-// OrderEvent represents an order-related event
-type OrderEvent struct {
-	OrderID   string    `json:"order_id"`
-	UserID    string    `json:"user_id"`
-	Amount    float64   `json:"amount"`
-	Status    string    `json:"status"`
-	CreatedAt time.Time `json:"created_at"`
-}
-
 func main() {
 	// Create type-safe event bus
 	eventBus := bus.NewTyped[UserEvent]()
@@ -68,8 +59,8 @@ func main() {
 	fmt.Println("\n=== Example 5: Monitoring and Metrics ===")
 	metricsExample(eventBus)
 
-	// Example 6: Error handling
-	fmt.Println("\n=== Example 6: Error Handling ===")
+	// Example 6: Handler errors
+	fmt.Println("\n=== Example 6: Handler Errors ===")
 	errorHandlingExample(eventBus)
 
 	// Example 7: Timeout publishing
@@ -82,9 +73,13 @@ func main() {
 
 func basicExample(eventBus bus.Bus[UserEvent]) {
 	// Subscribe to user events
-	handle := eventBus.SubscribeWithHandle("user.login", func(event UserEvent) {
+	handle, err := eventBus.Subscribe("user.login", func(ctx context.Context, event UserEvent) error {
 		fmt.Printf("User login: %s at %s\n", event.UserID, event.Timestamp.Format("15:04:05"))
+		return nil
 	})
+	if err != nil {
+		log.Fatalf("subscribe: %v", err)
+	}
 	defer handle.Unsubscribe()
 
 	// Publish event
@@ -98,19 +93,22 @@ func basicExample(eventBus bus.Bus[UserEvent]) {
 
 func priorityExample(eventBus bus.Bus[UserEvent]) {
 	// High priority handler - security check
-	securityHandle := eventBus.SubscribeWithPriority("user.action", func(event UserEvent) {
+	securityHandle, _ := eventBus.Subscribe("user.action", func(ctx context.Context, event UserEvent) error {
 		fmt.Printf("🔒 Security check: User %s performing %s\n", event.UserID, event.Action)
-	}, bus.PriorityCritical)
+		return nil
+	}, bus.HandlerPriority(bus.PriorityCritical))
 
 	// Normal priority handler - logging
-	logHandle := eventBus.SubscribeWithPriority("user.action", func(event UserEvent) {
+	logHandle, _ := eventBus.Subscribe("user.action", func(ctx context.Context, event UserEvent) error {
 		fmt.Printf("📝 Logging: User %s performed %s\n", event.UserID, event.Action)
-	}, bus.PriorityNormal)
+		return nil
+	}, bus.HandlerPriority(bus.PriorityNormal))
 
 	// Low priority handler - analytics
-	analyticsHandle := eventBus.SubscribeWithPriority("user.action", func(event UserEvent) {
+	analyticsHandle, _ := eventBus.Subscribe("user.action", func(ctx context.Context, event UserEvent) error {
 		fmt.Printf("📊 Analytics: User %s performed %s\n", event.UserID, event.Action)
-	}, bus.PriorityLow)
+		return nil
+	}, bus.HandlerPriority(bus.PriorityLow))
 
 	defer func() {
 		securityHandle.Unsubscribe()
@@ -128,17 +126,19 @@ func priorityExample(eventBus bus.Bus[UserEvent]) {
 
 func filterExample(eventBus bus.Bus[UserEvent]) {
 	// Only process admin user events
-	adminHandle := eventBus.SubscribeWithFilter("user.action", func(event UserEvent) {
+	adminHandle, _ := eventBus.Subscribe("user.action", func(ctx context.Context, event UserEvent) error {
 		fmt.Printf("👑 Admin action: %s performed %s\n", event.UserID, event.Action)
-	}, func(topic string, event UserEvent) bool {
+		return nil
+	}, bus.HandlerFilter(func(topic string, event UserEvent) bool {
 		// Assume admin user IDs start with "admin_"
 		return strings.HasPrefix(event.UserID, "admin_")
-	})
+	}))
 
 	// Only process sensitive operations
-	sensitiveHandle := eventBus.SubscribeWithFilter("user.action", func(event UserEvent) {
+	sensitiveHandle, _ := eventBus.Subscribe("user.action", func(ctx context.Context, event UserEvent) error {
 		fmt.Printf("⚠️  Sensitive operation alert: %s performed %s\n", event.UserID, event.Action)
-	}, func(topic string, event UserEvent) bool {
+		return nil
+	}, bus.HandlerFilter(func(topic string, event UserEvent) bool {
 		sensitiveActions := []string{"delete", "modify_permissions", "export_data"}
 		for _, action := range sensitiveActions {
 			if event.Action == action {
@@ -146,7 +146,7 @@ func filterExample(eventBus bus.Bus[UserEvent]) {
 			}
 		}
 		return false
-	})
+	}))
 
 	defer func() {
 		adminHandle.Unsubscribe()
@@ -171,9 +171,10 @@ func contextExample(eventBus bus.Bus[UserEvent]) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	// Subscribe with context
-	handle := eventBus.SubscribeWithContext(ctx, "user.session", func(event UserEvent) {
+	handle, _ := eventBus.Subscribe("user.session", func(ctx context.Context, event UserEvent) error {
 		fmt.Printf("Session event: %s - %s\n", event.UserID, event.Action)
-	})
+		return nil
+	}, bus.HandlerContext(ctx))
 	defer handle.Unsubscribe()
 
 	// Publish an event - should be processed
@@ -200,12 +201,14 @@ func contextExample(eventBus bus.Bus[UserEvent]) {
 
 func metricsExample(eventBus bus.Bus[UserEvent]) {
 	// Subscribe multiple handlers
-	handle1 := eventBus.SubscribeWithHandle("metrics.test", func(event UserEvent) {
+	handle1, _ := eventBus.Subscribe("metrics.test", func(ctx context.Context, event UserEvent) error {
 		fmt.Printf("Handler 1 processing: %s\n", event.UserID)
+		return nil
 	})
 
-	handle2 := eventBus.SubscribeWithHandle("metrics.test", func(event UserEvent) {
+	handle2, _ := eventBus.Subscribe("metrics.test", func(ctx context.Context, event UserEvent) error {
 		fmt.Printf("Handler 2 processing: %s\n", event.UserID)
+		return nil
 	})
 
 	defer func() {
@@ -239,32 +242,36 @@ func metricsExample(eventBus bus.Bus[UserEvent]) {
 }
 
 func errorHandlingExample(eventBus bus.Bus[UserEvent]) {
-	// Subscribe a handler that will panic
-	panicHandle := eventBus.SubscribeWithHandle("user.error", func(event UserEvent) {
-		if event.Action == "panic" {
-			panic("simulating handler crash")
+	// A handler can now report a business failure by returning an error; the
+	// publish call returns the joined failures of the synchronous handlers.
+	errorHandle, _ := eventBus.Subscribe("user.error", func(ctx context.Context, event UserEvent) error {
+		if event.Action == "fail" {
+			return fmt.Errorf("simulated business failure for %s", event.UserID)
 		}
 		fmt.Printf("Normal processing: %s\n", event.UserID)
+		return nil
 	})
-	defer panicHandle.Unsubscribe()
+	defer errorHandle.Unsubscribe()
 
 	// Publish normal event
-	eventBus.Publish("user.error", UserEvent{
+	if err := eventBus.Publish("user.error", UserEvent{
 		UserID:    "user_normal",
 		Action:    "normal",
 		Timestamp: time.Now(),
-	})
+	}); err != nil {
+		fmt.Printf("Unexpected publish error: %v\n", err)
+	}
 
-	// Publish event that will cause panic
-	fmt.Println("Publishing event that will cause panic...")
-	eventBus.Publish("user.error", UserEvent{
-		UserID:    "user_panic",
-		Action:    "panic",
+	// Publish event whose handler fails; the error comes back from Publish
+	// and is also reported to the ErrorHandler.
+	fmt.Println("Publishing event whose handler fails...")
+	if err := eventBus.Publish("user.error", UserEvent{
+		UserID:    "user_fail",
+		Action:    "fail",
 		Timestamp: time.Now(),
-	})
-
-	// Wait for processing to complete
-	eventBus.WaitAsync()
+	}); err != nil {
+		fmt.Printf("Publish returned the handler failure: %v\n", err)
+	}
 
 	// Check error metrics
 	metrics := eventBus.GetMetrics()
@@ -273,11 +280,19 @@ func errorHandlingExample(eventBus bus.Bus[UserEvent]) {
 }
 
 func timeoutExample(eventBus bus.Bus[UserEvent]) {
-	// Subscribe an async slow handler
-	eventBus.SubscribeAsync("user.slow", func(event UserEvent) {
-		time.Sleep(2 * time.Second) // Simulate slow processing
-		fmt.Printf("Slow processing completed: %s\n", event.UserID)
-	}, false)
+	// Subscribe a slow handler with a per-handler timeout. The handler's
+	// context is canceled when the timeout elapses, so it can stop early.
+	handle, _ := eventBus.Subscribe("user.slow", func(ctx context.Context, event UserEvent) error {
+		select {
+		case <-time.After(2 * time.Second): // Simulate slow processing
+			fmt.Printf("Slow processing completed: %s\n", event.UserID)
+			return nil
+		case <-ctx.Done():
+			fmt.Printf("Slow processing canceled for %s: %v\n", event.UserID, ctx.Err())
+			return ctx.Err()
+		}
+	}, bus.HandlerTimeout(500*time.Millisecond))
+	defer handle.Unsubscribe()
 
 	// Use timeout publishing
 	err := eventBus.PublishWithTimeout("user.slow", UserEvent{
@@ -289,4 +304,5 @@ func timeoutExample(eventBus bus.Bus[UserEvent]) {
 	if err != nil {
 		fmt.Printf("Publish timeout: %v\n", err)
 	}
+	eventBus.WaitAsync()
 }

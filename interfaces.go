@@ -7,25 +7,12 @@ import (
 
 // BusSubscriber defines subscription-related bus behavior
 type BusSubscriber[T any] interface {
-	Subscribe(topic string, fn func(T)) error
-	SubscribeAsync(topic string, fn func(T), transactional bool) error
-	SubscribeOnce(topic string, fn func(T)) error
-	SubscribeOnceAsync(topic string, fn func(T)) error
-	SubscribeWithHandle(topic string, fn func(T)) *Handle[T]
-	SubscribeAsyncWithHandle(topic string, fn func(T), transactional bool) *Handle[T]
-	SubscribeWithPriority(topic string, fn func(T), priority Priority) *Handle[T]
-	SubscribeWithFilter(topic string, fn func(T), filter EventFilter[T]) *Handle[T]
-	SubscribeWithContext(ctx context.Context, topic string, fn func(T)) *Handle[T]
-}
-
-// ControlledSubscriber defines optional handler-level execution control behavior.
-type ControlledSubscriber[T any] interface {
-	SubscribeWithOptions(topic string, fn func(T), options ...HandlerOption) (*Handle[T], error)
+	Subscribe(topic string, fn Handler[T], options ...HandlerOption) (*Handle[T], error)
 }
 
 // BusPublisher defines publishing-related bus behavior
 type BusPublisher[T any] interface {
-	Publish(topic string, event T)
+	Publish(topic string, event T) error
 	PublishWithContext(ctx context.Context, topic string, event T) error
 	PublishWithTimeout(topic string, event T, timeout time.Duration) error
 }

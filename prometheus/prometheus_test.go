@@ -1,6 +1,7 @@
 package prometheus
 
 import (
+	"context"
 	"testing"
 
 	client "github.com/prometheus/client_golang/prometheus"
@@ -19,10 +20,14 @@ func TestMetricsImplementsBusMetrics(t *testing.T) {
 	eventBus := bus.NewTyped[string](bus.WithMetrics[string](metrics))
 	defer eventBus.Close()
 
-	if _, err := eventBus.SubscribeWithOptions("topic", func(event string) {}, bus.HandlerSerial()); err != nil {
+	if _, err := eventBus.Subscribe("topic", func(ctx context.Context, event string) error {
+		return nil
+	}, bus.HandlerSerial()); err != nil {
 		t.Fatalf("Unexpected subscribe error: %v", err)
 	}
-	eventBus.Publish("topic", "event")
+	if err := eventBus.Publish("topic", "event"); err != nil {
+		t.Fatalf("Unexpected publish error: %v", err)
+	}
 
 	published, processed, failed, subscribers := metrics.GetStats()
 	if published != 1 || processed != 1 || failed != 0 || subscribers != 1 {

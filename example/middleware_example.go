@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"time"
@@ -55,12 +56,14 @@ func main() {
 	})
 
 	// Subscribe to events
-	handle1 := eventBus.SubscribeWithHandle("user.created", func(event Event) {
+	handle1, _ := eventBus.Subscribe("user.created", func(ctx context.Context, event Event) error {
 		fmt.Printf("User created handler: %s - %s\n", event.ID, event.Payload)
+		return nil
 	})
 
-	handle2 := eventBus.SubscribeWithHandle("rate.limited", func(event Event) {
+	handle2, _ := eventBus.Subscribe("rate.limited", func(ctx context.Context, event Event) error {
 		fmt.Printf("Rate limited handler: %s - %s\n", event.ID, event.Payload)
+		return nil
 	})
 
 	defer func() {

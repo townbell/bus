@@ -2,6 +2,7 @@ package bus
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"os"
 	"strings"
@@ -127,9 +128,7 @@ func TestEventBusWithLogger(t *testing.T) {
 	}
 
 	// Test subscription logging
-	handle := eventBus.SubscribeWithHandle("test.topic", func(data string) {
-		// Handler logic
-	})
+	handle := mustSubscribe(t, eventBus, "test.topic", discard[string])
 
 	logs := testLogger.GetLogs()
 	if !strings.Contains(logs, "Handler subscribed to topic 'test.topic'") {
@@ -169,7 +168,7 @@ func TestEventBusLoggerWithPanic(t *testing.T) {
 	eventBus.SetLogger(testLogger)
 
 	// Subscribe a handler that panics
-	eventBus.Subscribe("panic.topic", func(data string) {
+	mustSubscribe(t, eventBus, "panic.topic", func(ctx context.Context, data string) error {
 		panic("test panic")
 	})
 
@@ -182,6 +181,26 @@ func TestEventBusLoggerWithPanic(t *testing.T) {
 	}
 }
 
+func TestEventBusLoggerWithHandlerError(t *testing.T) {
+	testLogger := NewTestLogger()
+	eventBus := NewTyped[string]()
+	eventBus.SetLogger(testLogger)
+
+	mustSubscribe(t, eventBus, "error.topic", func(ctx context.Context, data string) error {
+		return fmt.Errorf("business failure")
+	})
+
+	_ = eventBus.Publish("error.topic", "test data")
+
+	logs := testLogger.GetLogs()
+	if !strings.Contains(logs, "Handler failed for topic 'error.topic'") {
+		t.Errorf("Expected handler failure log, got: %s", logs)
+	}
+	if strings.Contains(logs, "Handler panic") {
+		t.Errorf("A returned error must not be logged as a panic, got: %s", logs)
+	}
+}
+
 func TestEventBusLoggerLevels(t *testing.T) {
 	testLogger := NewTestLogger()
 	eventBus := NewTyped[string]()
@@ -191,7 +210,7 @@ func TestEventBusLoggerLevels(t *testing.T) {
 	testLogger.SetLevel(LogLevelError)
 
 	// Subscribe and publish
-	eventBus.Subscribe("test.topic", func(data string) {})
+	mustSubscribe(t, eventBus, "test.topic", discard[string])
 	eventBus.Publish("test.topic", "test data")
 
 	logs := testLogger.GetLogs()
@@ -202,7 +221,7 @@ func TestEventBusLoggerLevels(t *testing.T) {
 
 	// Test with panic (should show error)
 	testLogger.Clear()
-	eventBus.Subscribe("panic.topic", func(data string) {
+	mustSubscribe(t, eventBus, "panic.topic", func(ctx context.Context, data string) error {
 		panic("test panic")
 	})
 	eventBus.Publish("panic.topic", "test data")
@@ -218,11 +237,11 @@ func TestEventBusWithNoOpLogger(t *testing.T) {
 	eventBus.SetLogger(NewNoOpLogger())
 
 	// Should not panic with no-op logger
-	eventBus.Subscribe("test.topic", func(data string) {})
+	mustSubscribe(t, eventBus, "test.topic", discard[string])
 	eventBus.Publish("test.topic", "test data")
 
 	// Subscribe a handler that panics
-	eventBus.Subscribe("panic.topic", func(data string) {
+	mustSubscribe(t, eventBus, "panic.topic", func(ctx context.Context, data string) error {
 		panic("test panic")
 	})
 	eventBus.Publish("panic.topic", "test data")
@@ -241,8 +260,9 @@ func TestLoggerConcurrency(t *testing.T) {
 			defer func() { done <- true }()
 
 			topic := "concurrent.topic"
-			eventBus.Subscribe(topic, func(data int) {
+			_, _ = eventBus.Subscribe(topic, func(ctx context.Context, data int) error {
 				time.Sleep(1 * time.Millisecond)
+				return nil
 			})
 
 			for j := 0; j < 5; j++ {
@@ -267,9 +287,7 @@ func BenchmarkEventBusWithLogger(b *testing.B) {
 	eventBus := NewTyped[string]()
 	eventBus.SetLogger(NewDefaultLogger())
 
-	eventBus.Subscribe("bench.topic", func(data string) {
-		// Simple handler
-	})
+	mustSubscribe(b, eventBus, "bench.topic", discard[string])
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -281,9 +299,7 @@ func BenchmarkEventBusWithNoOpLogger(b *testing.B) {
 	eventBus := NewTyped[string]()
 	eventBus.SetLogger(NewNoOpLogger())
 
-	eventBus.Subscribe("bench.topic", func(data string) {
-		// Simple handler
-	})
+	mustSubscribe(b, eventBus, "bench.topic", discard[string])
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {

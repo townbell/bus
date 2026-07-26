@@ -1,6 +1,7 @@
 package bus
 
 import (
+	"context"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -50,9 +51,7 @@ func TestCustomMetricsImplementation(t *testing.T) {
 	defer bus.Close()
 
 	// Subscribe to an event
-	handle := bus.SubscribeWithHandle("test.topic", func(event any) {
-		// Normal processing
-	})
+	handle := mustSubscribe(t, bus, "test.topic", discard[any])
 	defer handle.Unsubscribe()
 
 	// Check subscriber count
@@ -118,9 +117,7 @@ func TestWithOptions(t *testing.T) {
 	defer bus.Close()
 
 	// Test publish and subscribe
-	bus.Subscribe("test.options", func(event any) {
-		// Normal processing
-	})
+	mustSubscribe(t, bus, "test.options", discard[any])
 
 	bus.Publish("test.options", "test event")
 	bus.WaitAsync()
@@ -138,6 +135,25 @@ func TestWithOptions(t *testing.T) {
 	metricsFromBus := bus.GetMetrics()
 	if metricsFromBus != customMetrics {
 		t.Errorf("Expected metrics from bus to be our custom metrics instance")
+	}
+}
+
+func TestHandlerErrorRecordedInDetailedMetrics(t *testing.T) {
+	bus := NewTyped[string]()
+	defer bus.Close()
+
+	mustSubscribe(t, bus, "orders.created", func(ctx context.Context, event string) error {
+		return context.DeadlineExceeded
+	})
+	_ = bus.Publish("orders.created", "o-1")
+
+	detailed, ok := bus.GetMetrics().(*DefaultMetrics)
+	if !ok {
+		t.Fatal("Expected the default metrics implementation")
+	}
+	stats := detailed.GetTopicStats()["orders.created"]
+	if stats.FailedEvents != 1 {
+		t.Fatalf("Expected the returned handler error to count as a failed delivery, got %d", stats.FailedEvents)
 	}
 }
 
