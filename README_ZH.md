@@ -12,7 +12,7 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/townbell/bus.svg)](https://pkg.go.dev/github.com/townbell/bus)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Go Report Card](https://goreportcard.com/badge/github.com/townbell/bus)](https://goreportcard.com/report/github.com/townbell/bus)
-[![Coverage](https://img.shields.io/badge/coverage-93.3%25-brightgreen.svg)](https://github.com/townbell/bus/actions/workflows/ci.yml)
+[![Coverage](https://img.shields.io/badge/coverage-95.5%25-brightgreen.svg)](https://github.com/townbell/bus/actions/workflows/ci.yml)
 
 
 
@@ -234,6 +234,15 @@ eventBus.SetErrorHandler(func(err *bus.EventError) {
 })
 ```
 
+恢复的 panic 以 `*bus.PanicError` 的形式到达，可以与普通 handler 错误区分开：
+
+```go
+var pe *bus.PanicError
+if errors.As(err, &pe) {
+    log.Printf("handler panic: %v", pe.Value)
+}
+```
+
 ### 中间件
 
 添加处理中间件：
@@ -340,7 +349,7 @@ handle, err := eventBus.Subscribe("payment.validate",
 - handler 返回错误不会中断派发：后续 handler 照常执行。只有发布 context 被取消、总线关闭、或 handler 在 `RecoverAndStop` 策略下 panic 时才会提前终止派发。
 - 同步 handler 在调用发布的 goroutine 中执行，收到从发布调用派生的 context；异步 handler 在独立 goroutine 中执行，收到订阅 context（`HandlerContext`），`HandlerAsync(true)` 时同一 handler 串行执行。
 - `HandlerTimeout` 限制发布调用的等待时间，并在超时到达时取消 handler 的 context；无视 context 的 handler 会继续在后台运行，仍会被 `WaitAsync` 和 `Close` 等待。
-- handler panic 会被恢复、计入失败并通过 `ErrorHandler` 上报；`RecoverAndContinue`（默认）继续派发，`RecoverAndStop` 中止本次发布。两种情况下恢复的 panic 都会出现在发布错误里。
+- handler panic 会以 `*PanicError` 的形式被恢复、计入失败并通过 `ErrorHandler` 上报；`RecoverAndContinue`（默认）继续派发，`RecoverAndStop` 中止本次发布。两种情况下恢复的 panic 都会出现在发布错误里，可用 `errors.As` 识别。
 - middleware 必须调用 `next()` 才会继续执行后续 middleware 和 handler；不调用 `next()` 可用于拦截事件。
 - `HandlerOnce` 的 handler 只会成功执行一次，即使同一 topic 下有多个一次性 handler。
 - `Close` 后不再接受新发布或订阅；已启动的异步 handler 会在关闭流程中等待完成。
@@ -553,7 +562,7 @@ go test -coverprofile=coverage.out ./...
 go tool cover -html=coverage.out -o coverage.html
 ```
 
-**当前覆盖率：核心模块 93.3%**，Prometheus 适配器 79.7%。CI 对核心模块设了 90% 的下限门槛，这个数字不会再悄悄漂移。
+**当前覆盖率：核心模块 95.5%**，Prometheus 适配器 79.7%。CI 对核心模块设了 90% 的下限门槛，这个数字不会再悄悄漂移。
 
 运行性能测试：
 
@@ -563,27 +572,33 @@ go test -bench=. -benchmem
 
 ## 📈 性能
 
-测试环境：Apple M5（10 核）、Go 1.22.12、darwin/arm64，测量日期 2026-07-26。
-所有基准测试都使用 `b.RunParallel`，因此 `ns/op` 是全部核心上的聚合成本，不是单
-goroutine 延迟。
+测试环境：Apple M5（10 核）、Go 1.22.12、darwin/arm64，测量日期 2026-07-27
+（v0.8.0）。所有基准测试都使用 `b.RunParallel`，因此 `ns/op` 是全部核心上的聚合
+成本，不是单 goroutine 延迟。
 
 | 基准测试 | ns/op | B/op | allocs/op |
 | --- | --- | --- | --- |
-| `SyncPublish`（1 个订阅者） | 839 | 392 | 11 |
-| `AsyncPublish`（1 个订阅者） | 1320 | 520 | 12 |
-| `MultipleSubscribers` | 4470 | 752 | 29 |
-| `WithPriority` | 532 | 472 | 15 |
-| `WithFilter` | 240 | 376 | 10 |
-| `ConcurrentSubscribeUnsubscribe` | 3613 | 1207 | 38 |
-| `ChannelBaseline`（裸 Go channel） | 50 | 0 | 0 |
+| `SyncPublish`（1 个订阅者） | 350 | 0 | 0 |
+| `AsyncPublish`（1 个订阅者） | 784 | 128 | 1 |
+| `MultipleSubscribers`（10 个订阅者） | 2580 | 0 | 0 |
+| `WithPriority` | 254 | 0 | 0 |
+| `WithFilter` | 63 | 0 | 0 |
+| `ConcurrentSubscribeUnsubscribe` | 2964 | 713 | 14 |
+| `ChannelBaseline`（裸 Go channel） | 49 | 0 | 0 |
 
-这张表里有两点值得注意：
+**同步发布零分配。** handler 列表采用 copy-on-write：订阅变更时构建新切片，
+发布路径直接使用当前列表而无需拷贝；无中间件时整套中间件机制与 debug 日志
+调用也会被完全跳过。v0.8.0 把一次同步发布从 839 ns、11 次分配降到 350 ns、
+零分配。
+
+另外两点值得注意：
 
 - **异步发布比同步发布慢，而不是快。** 每次异步派发都要启动 goroutine，并操作
   `WaitGroup` 和互斥锁。选择异步是为了把慢 handler 挪出发布 goroutine，不是为了
   提高吞吐。
-- **裸 channel 大约便宜 17 倍。** 事件总线换来的是扇出、优先级、过滤器、中间件和
-  监控指标；如果你只需要把一个值交给某个已知的 goroutine，channel 才是更合适的工具。
+- **裸 channel 依然更便宜**——单 goroutine 下约 2 倍。事件总线换来的是扇出、
+  优先级、过滤器、中间件和监控指标；如果你只需要把一个值交给某个已知的
+  goroutine，channel 才是更合适的工具。
 
 不同硬件上的数字会有差异。请自己重跑基准测试，不要直接采信这张表。
 

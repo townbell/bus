@@ -162,20 +162,22 @@ func (bus *EventBus[T]) Subscribe(topic string, fn Handler[T], options ...Handle
 	}
 	bus.prepareHandlerLocked(topic, handler)
 
-	// Insert before the first handler with strictly lower priority, so equal
+	// Handler slices are copy-on-write: once stored in the map they are never
+	// mutated, so a publish can use them without taking its own copy. Insert
+	// before the first handler with strictly lower priority, so equal
 	// priorities keep subscription order.
-	handlers := bus.handlers[topic]
-	inserted := false
-	for i, h := range handlers {
+	old := bus.handlers[topic]
+	at := len(old)
+	for i, h := range old {
 		if handler.priority > h.priority {
-			handlers = append(handlers[:i], append([]*eventHandler[T]{handler}, handlers[i:]...)...)
-			inserted = true
+			at = i
 			break
 		}
 	}
-	if !inserted {
-		handlers = append(handlers, handler)
-	}
+	handlers := make([]*eventHandler[T], 0, len(old)+1)
+	handlers = append(handlers, old[:at]...)
+	handlers = append(handlers, handler)
+	handlers = append(handlers, old[at:]...)
 	bus.handlers[topic] = handlers
 	if isPatternTopic(topic) {
 		bus.patternTopics[topic] = struct{}{}
@@ -253,7 +255,9 @@ func (bus *EventBus[T]) PublishWithContext(ctx context.Context, topic string, ev
 	deadEventHandler := bus.deadEventHandler
 	metrics := bus.metrics
 	closeCh := bus.closeCh
-	handlers := append([]*eventHandler[T](nil), bus.handlers[topic]...)
+	// Handler slices are copy-on-write (see Subscribe), so the map value can
+	// be used directly without copying on the hot path.
+	handlers := bus.handlers[topic]
 	// Merge handlers subscribed to matching patterns. Pattern names are
 	// sorted so that same-priority handlers from different patterns keep a
 	// deterministic order across publishes.
@@ -265,18 +269,23 @@ func (bus *EventBus[T]) PublishWithContext(ctx context.Context, topic string, ev
 	}
 	if len(patterns) > 0 {
 		sort.Strings(patterns)
+		merged := make([]*eventHandler[T], 0, len(handlers)+len(patterns))
+		merged = append(merged, handlers...)
 		for _, pattern := range patterns {
-			handlers = append(handlers, bus.handlers[pattern]...)
+			merged = append(merged, bus.handlers[pattern]...)
 		}
-		sort.SliceStable(handlers, func(i, j int) bool {
-			return handlers[i].priority > handlers[j].priority
+		sort.SliceStable(merged, func(i, j int) bool {
+			return merged[i].priority > merged[j].priority
 		})
+		handlers = merged
 	}
 	middlewares := append([]EventMiddleware[any](nil), bus.middlewares...)
 	bus.lock.RUnlock()
 
-	// Log event publishing
-	if logger != nil {
+	// A varargs call boxes its arguments before the logger can filter by
+	// level, so the level check happens here, once per publish.
+	debugLog := logger != nil && logger.GetLevel() <= LogLevelDebug
+	if debugLog {
 		logger.Debug("Publishing event to topic '%s'", topic)
 	}
 
@@ -289,8 +298,14 @@ func (bus *EventBus[T]) PublishWithContext(ctx context.Context, topic string, ev
 		deadEventHandler(topic, event)
 	}
 
+	// Fast path: with no middleware there is no reason to box the event into
+	// any or allocate the chain closures.
+	if len(middlewares) == 0 {
+		return bus.dispatch(ctx, topic, event, handlers, closeCh, logger, debugLog, errorHandler, metrics)
+	}
+
 	dispatch := func() error {
-		return bus.dispatch(ctx, topic, event, handlers, closeCh, logger, errorHandler, metrics)
+		return bus.dispatch(ctx, topic, event, handlers, closeCh, logger, debugLog, errorHandler, metrics)
 	}
 	dispatchErr, middlewareErr := runMiddlewares(middlewares, topic, event, dispatch)
 	if middlewareErr != nil {
@@ -330,18 +345,15 @@ func runMiddlewares(middlewares []EventMiddleware[any], topic string, event any,
 	return dispatchErr, middlewareErr
 }
 
-func (bus *EventBus[T]) dispatch(ctx context.Context, topic string, event T, handlers []*eventHandler[T], closeCh <-chan struct{}, logger Logger, errorHandler ErrorHandler, metrics Metrics) error {
+func (bus *EventBus[T]) dispatch(ctx context.Context, topic string, event T, handlers []*eventHandler[T], closeCh <-chan struct{}, logger Logger, debugLog bool, errorHandler ErrorHandler, metrics Metrics) error {
 	var errs []error
-	abort := func(err error) error {
-		return errors.Join(append(errs, err)...)
-	}
 
 	for _, handler := range handlers {
 		select {
 		case <-ctx.Done():
-			return abort(ctx.Err())
+			return errors.Join(append(errs, ctx.Err())...)
 		case <-closeCh:
-			return abort(fmt.Errorf("event bus is closed"))
+			return errors.Join(append(errs, fmt.Errorf("event bus is closed"))...)
 		default:
 		}
 
@@ -362,7 +374,7 @@ func (bus *EventBus[T]) dispatch(ctx context.Context, topic string, event T, han
 		}
 
 		if !handler.async {
-			err, stop := bus.doPublish(ctx, closeCh, handler, topic, event, logger, errorHandler, metrics)
+			err, stop := bus.doPublish(ctx, closeCh, handler, topic, event, logger, debugLog, errorHandler, metrics)
 			if err != nil {
 				errs = append(errs, err)
 			}
@@ -373,12 +385,12 @@ func (bus *EventBus[T]) dispatch(ctx context.Context, topic string, event T, han
 		}
 
 		if !bus.addAsync() {
-			return abort(fmt.Errorf("event bus is closed"))
+			return errors.Join(append(errs, fmt.Errorf("event bus is closed"))...)
 		}
 		if handler.transactional {
 			handler.Lock()
 		}
-		go bus.doPublishAsync(handler, topic, event, closeCh, logger, errorHandler, metrics)
+		go bus.doPublishAsync(handler, topic, event, closeCh, logger, debugLog, errorHandler, metrics)
 	}
 	return errors.Join(errs...)
 }
@@ -400,17 +412,24 @@ func (bus *EventBus[T]) PublishWithTimeout(topic string, event T, timeout time.D
 	return bus.PublishWithContext(ctx, topic, event)
 }
 
-type handlerPanicError struct {
-	value interface{}
+// PanicError wraps a value recovered from a panicking handler. It reaches the
+// ErrorHandler and, for synchronous handlers, the joined publish error, so
+// callers can tell panics apart from ordinary handler errors:
+//
+//	var pe *bus.PanicError
+//	if errors.As(err, &pe) { ... }
+type PanicError struct {
+	// Value is the value the handler panicked with.
+	Value any
 }
 
-func (e *handlerPanicError) Error() string {
-	return fmt.Sprintf("panic: %v", e.value)
+func (e *PanicError) Error() string {
+	return fmt.Sprintf("panic: %v", e.Value)
 }
 
 // doPublish runs one handler and records the outcome. The second return value
 // reports whether dispatch must stop (a recovered panic under RecoverAndStop).
-func (bus *EventBus[T]) doPublish(ctx context.Context, closeCh <-chan struct{}, handler *eventHandler[T], topic string, event T, logger Logger, errorHandler ErrorHandler, metrics Metrics) (error, bool) {
+func (bus *EventBus[T]) doPublish(ctx context.Context, closeCh <-chan struct{}, handler *eventHandler[T], topic string, event T, logger Logger, debugLog bool, errorHandler ErrorHandler, metrics Metrics) (error, bool) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -420,7 +439,7 @@ func (bus *EventBus[T]) doPublish(ctx context.Context, closeCh <-chan struct{}, 
 	duration := time.Since(start)
 
 	if err == nil {
-		if logger != nil {
+		if debugLog {
 			logger.Debug("Handler executed successfully for topic '%s'", topic)
 		}
 		metrics.IncrementProcessed()
@@ -430,7 +449,7 @@ func (bus *EventBus[T]) doPublish(ctx context.Context, closeCh <-chan struct{}, 
 		return nil, false
 	}
 
-	var panicErr *handlerPanicError
+	var panicErr *PanicError
 	isPanic := errors.As(err, &panicErr)
 	if logger != nil {
 		if isPanic {
@@ -502,7 +521,7 @@ func (bus *EventBus[T]) runHandlerWithoutTimeout(ctx context.Context, closeCh <-
 	}()
 	defer func() {
 		if r := recover(); r != nil {
-			err = &handlerPanicError{value: r}
+			err = &PanicError{Value: r}
 		}
 	}()
 	return handler.callBack(ctx, event)
@@ -522,7 +541,7 @@ func acquireConcurrency[T any](ctx context.Context, closeCh <-chan struct{}, han
 	}
 }
 
-func (bus *EventBus[T]) doPublishAsync(handler *eventHandler[T], topic string, event T, closeCh <-chan struct{}, logger Logger, errorHandler ErrorHandler, metrics Metrics) {
+func (bus *EventBus[T]) doPublishAsync(handler *eventHandler[T], topic string, event T, closeCh <-chan struct{}, logger Logger, debugLog bool, errorHandler ErrorHandler, metrics Metrics) {
 	defer bus.wg.Done()
 	defer func() {
 		if handler.transactional {
@@ -536,7 +555,7 @@ func (bus *EventBus[T]) doPublishAsync(handler *eventHandler[T], topic string, e
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	_, _ = bus.doPublish(ctx, closeCh, handler, topic, event, logger, errorHandler, metrics)
+	_, _ = bus.doPublish(ctx, closeCh, handler, topic, event, logger, debugLog, errorHandler, metrics)
 }
 
 func (bus *EventBus[T]) removeHandler(topic string, target *eventHandler[T]) bool {
@@ -551,13 +570,17 @@ func (bus *EventBus[T]) removeHandler(topic string, target *eventHandler[T]) boo
 		if handler != target {
 			continue
 		}
-		l := len(bus.handlers[topic])
-		copy(bus.handlers[topic][idx:], bus.handlers[topic][idx+1:])
-		bus.handlers[topic][l-1] = nil
-		bus.handlers[topic] = bus.handlers[topic][:l-1]
-		if len(bus.handlers[topic]) == 0 {
+		// Copy-on-write: build a fresh slice so publishes holding the old one
+		// keep a consistent view without copying on their hot path.
+		old := bus.handlers[topic]
+		if len(old) == 1 {
 			delete(bus.handlers, topic)
 			delete(bus.patternTopics, topic)
+		} else {
+			handlers := make([]*eventHandler[T], 0, len(old)-1)
+			handlers = append(handlers, old[:idx]...)
+			handlers = append(handlers, old[idx+1:]...)
+			bus.handlers[topic] = handlers
 		}
 		bus.metrics.DecrementSubscribers()
 

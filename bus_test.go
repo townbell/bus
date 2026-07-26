@@ -240,6 +240,38 @@ func TestPanicIsRecoveredAndReported(t *testing.T) {
 	}
 }
 
+func TestPanicErrorIsDetectable(t *testing.T) {
+	bus := NewTyped[TestEvent]()
+	defer bus.Close()
+	bus.SetLogger(NewNoOpLogger())
+
+	reported := make(chan error, 1)
+	bus.SetErrorHandler(func(err *EventError) {
+		reported <- err.Err
+	})
+
+	mustSubscribe(t, bus, "panic.detect", func(ctx context.Context, event TestEvent) error {
+		panic("kaboom")
+	})
+	mustSubscribe(t, bus, "error.detect", func(ctx context.Context, event TestEvent) error {
+		return errors.New("ordinary failure")
+	})
+
+	err := bus.Publish("panic.detect", TestEvent{ID: "p"})
+	var pe *PanicError
+	if !errors.As(err, &pe) || pe.Value != "kaboom" {
+		t.Fatalf("Expected a PanicError carrying the panic value in the publish error, got %v", err)
+	}
+	if !errors.As(<-reported, &pe) {
+		t.Fatal("Expected the ErrorHandler to receive a PanicError")
+	}
+
+	err = bus.Publish("error.detect", TestEvent{ID: "e"})
+	if errors.As(err, &pe) {
+		t.Fatal("An ordinary handler error must not be a PanicError")
+	}
+}
+
 func TestHandlerErrorsAreJoinedAndDispatchContinues(t *testing.T) {
 	bus := NewTyped[TestEvent]()
 	defer bus.Close()
