@@ -41,6 +41,11 @@ func (e *EventError) Error() string {
 	return fmt.Sprintf("event error in topic '%s': %v", e.Topic, e.Err)
 }
 
+// DeadEventHandler observes events published to a topic with no subscribed
+// handlers, in the spirit of Guava's DeadEvent. It runs synchronously in the
+// publishing goroutine, so it should return quickly.
+type DeadEventHandler[T any] func(topic string, event T)
+
 // EventFilter allows filtering events before they reach handlers
 type EventFilter[T any] func(topic string, event T) bool
 

@@ -160,6 +160,30 @@ sensitiveHandle, _ := eventBus.Subscribe("user.action", func(ctx context.Context
 }))
 ```
 
+### Topic 模式
+
+订阅的 topic 可以是模式。`"*"` 接收所有事件；末尾的 `".*"` 接收某个前缀之下的
+全部事件——`orders.*` 匹配 `orders.created` 和 `orders.created.eu`，但不匹配
+`orders` 本身。模式 handler 会与该 topic 的精确 handler 合并，按优先级顺序执行：
+
+```go
+// 审计 orders 之下的一切
+eventBus.Subscribe("orders.*", func(ctx context.Context, event OrderEvent) error {
+    return audit.Record(ctx, event)
+}, bus.HandlerPriority(bus.PriorityLow))
+```
+
+### Dead Events
+
+发布到无人订阅的 topic 的事件通常意味着 topic 拼错了。dead-event handler
+让它们显形，而不是无声消失：
+
+```go
+eventBus.SetDeadEventHandler(func(topic string, event OrderEvent) {
+    log.Printf("没有订阅者的 topic %q: %+v", topic, event)
+})
+```
+
 ### 上下文控制
 
 使用 context 进行取消和超时控制：
@@ -321,6 +345,8 @@ handle, err := eventBus.Subscribe("payment.validate",
 - `HandlerOnce` 的 handler 只会成功执行一次，即使同一 topic 下有多个一次性 handler。
 - `Close` 后不再接受新发布或订阅；已启动的异步 handler 会在关闭流程中等待完成。
 - 订阅被拒绝时（callback 为 nil、filter 类型不匹配、或总线已关闭），`Subscribe` 返回 `(nil, error)`。`nil` handle 可以安全使用：`Unsubscribe` 返回错误、`IsActive` 返回 `false`，因此忽略错误后 `defer handle.Unsubscribe()` 也不会 panic。
+- 模式订阅：`"*"` 匹配所有 topic，`"prefix.*"` 匹配严格位于 `prefix.` 之下的所有 topic（不含 `prefix` 本身）。命中的模式 handler 与精确 topic 的 handler 合并后按优先级执行；模式名经过排序，同优先级下顺序是确定的。`HasCallback` 和 `GetSubscriberCount` 仍是精确键查询。
+- dead-event handler 在发布找到零个订阅 handler 时触发，先于 middleware。filter 拒绝了事件的订阅者依然算订阅者，不会触发 dead event。它在发布方 goroutine 中同步执行。
 
 ## 🗺️ RoadMap
 
@@ -340,8 +366,8 @@ Townbell 会优先保持“进程内、类型安全、轻量事件总线”的�
 | P0 | 试运行（v0.6.0） | handler 错误上报 | handler 变为 `func(ctx, T) error`：业务失败无需 panic 即可进入指标、`ErrorHandler` 和发布返回值。解锁返回值收集。将在 v1.0.0 冻结 |
 | P0 | 试运行（v0.6.0） | `Publish` 错误语义 | `Publish` 返回同步 handler 失败的合并；忽略它依然合法。将在 v1.0.0 冻结 |
 | P2 | 未完成 | 返回值收集 | 参考 Blinker，提供 `PublishCollect` 一类 API，收集多个 handler 的返回值或错误 |
-| P2 | 部分完成 | Topic 增强 | 通配符（`*`）topic 已实现；层级 topic、无订阅者事件 hook 仍待开发 |
-| P2 | 未完成 | 集成示例 | 补充 `net/http`、Gin、CLI、worker 等实际项目中的使用方式 |
+| P2 | 已完成 | Topic 增强 | 通配符（`*`）topic、层级 `prefix.*` 模式、以及无订阅者时的 dead-event hook |
+| P2 | 部分完成 | 集成示例 | `net/http` 示例已提供；Gin、CLI、worker 待补充 |
 | P3 | 未完成 | Broker 桥接 | 参考 Watermill，探索 NATS / Kafka / RabbitMQ 适配器；优先放在独立子包，避免拖重核心库 |
 | P3 | 未完成 | Mediator 模式 | 参考 MediatR，按需提供 request / response、command、query、notification 子包 |
 | P4 | 未完成 | 状态型能力 | 评估 sticky event、事件回放、本地持久化等能力；仅在有明确场景时加入 |

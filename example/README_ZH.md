@@ -65,6 +65,20 @@ go run middleware_example.go
 go run e_commerce_example.go
 ```
 
+### 5. `http_example.go` - net/http 集成
+**演示内容：**
+- 在 HTTP handler 中发布领域事件
+- 用请求 context 约束同步派发
+- 异步订阅者在请求 goroutine 之外运行
+- 层级（`orders.*`）模式订阅
+- 用 dead-event handler 捕获投错的 topic
+- 退出前用 `WaitAsync` 排干异步工作
+
+**运行方式：**
+```bash
+go run http_example.go
+```
+
 ## 核心概念演示
 
 ### 使用泛型的类型安全

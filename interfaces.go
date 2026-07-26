@@ -8,6 +8,7 @@ import (
 // BusSubscriber defines subscription-related bus behavior
 type BusSubscriber[T any] interface {
 	Subscribe(topic string, fn Handler[T], options ...HandlerOption) (*Handle[T], error)
+	SetDeadEventHandler(handler DeadEventHandler[T])
 }
 
 // BusPublisher defines publishing-related bus behavior

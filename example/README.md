@@ -67,6 +67,20 @@ go run middleware_example.go
 go run e_commerce_example.go
 ```
 
+### 5. `http_example.go` - net/http Integration
+**What it demonstrates:**
+- Publishing domain events from HTTP handlers
+- Bounding synchronous dispatch with the request context
+- Async subscribers running off the request goroutine
+- Hierarchical (`orders.*`) pattern subscriptions
+- Catching misrouted topics with the dead-event handler
+- Draining async work with `WaitAsync` before shutdown
+
+**Run with:**
+```bash
+go run http_example.go
+```
+
 ## Key Concepts Demonstrated
 
 ### Type Safety with Generics
