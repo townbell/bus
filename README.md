@@ -162,6 +162,31 @@ sensitiveHandle, _ := eventBus.Subscribe("user.action", func(ctx context.Context
 }))
 ```
 
+### Topic Patterns
+
+A subscription topic can be a pattern. `"*"` receives every event; a trailing
+`".*"` receives everything under a prefix — `orders.*` matches
+`orders.created` and `orders.created.eu`, but not `orders` itself. Pattern
+handlers merge with the topic's own handlers and run in priority order:
+
+```go
+// Audit everything under orders.
+eventBus.Subscribe("orders.*", func(ctx context.Context, event OrderEvent) error {
+    return audit.Record(ctx, event)
+}, bus.HandlerPriority(bus.PriorityLow))
+```
+
+### Dead Events
+
+Events published to a topic with no subscribed handlers are usually a
+misspelled topic. A dead-event handler makes them visible instead of silent:
+
+```go
+eventBus.SetDeadEventHandler(func(topic string, event OrderEvent) {
+    log.Printf("no subscriber for %q: %+v", topic, event)
+})
+```
+
 ### Context Control
 
 Use context for cancellation and timeout control:
@@ -325,6 +350,8 @@ Available options: `HandlerPriority`, `HandlerFilter`, `HandlerContext`,
 - `HandlerOnce` handlers execute successfully at most once, including when multiple one-time handlers share a topic.
 - After `Close`, the bus rejects new publish and subscribe calls; already-started async handlers are allowed to finish.
 - `Subscribe` returns `(nil, error)` when the subscription is rejected (nil callback, mismatched filter type, or a closed bus). A `nil` handle is safe to use: `Unsubscribe` returns an error and `IsActive` returns `false`, so ignoring the error and deferring `Unsubscribe` never panics.
+- Pattern subscriptions: `"*"` matches every topic, `"prefix.*"` matches every topic strictly under `prefix.` (not `prefix` itself). Matched pattern handlers merge with exact-topic handlers and run in priority order; pattern names are sorted so same-priority ordering is deterministic. `HasCallback` and `GetSubscriberCount` remain exact-key lookups.
+- The dead-event handler fires when a publish finds zero subscribed handlers, before middleware runs. A subscriber whose filter rejects the event still counts as a subscriber, so no dead event fires. It runs synchronously in the publishing goroutine.
 
 ## 🗺️ RoadMap
 
@@ -344,8 +371,8 @@ Townbell will keep its focus on being an in-process, type-safe, lightweight even
 | P0 | Preview (v0.6.0) | Handler error reporting | Handlers are `func(ctx, T) error`: business failures reach metrics, the `ErrorHandler`, and the publish return value without panicking. Unblocks result collection. Freezes at v1.0.0 |
 | P0 | Preview (v0.6.0) | `Publish` error semantics | `Publish` returns the joined synchronous-handler failures; ignoring it stays legal. Freezes at v1.0.0 |
 | P2 | Planned | Result collection | Borrow from Blinker and add a `PublishCollect`-style API for collecting handler results or errors |
-| P2 | Partial | Topic enhancements | Wildcard (`*`) topics are implemented; hierarchical topics and no-subscriber hooks are still planned |
-| P2 | Planned | Integration examples | Add practical examples for `net/http`, Gin, CLI apps, and workers |
+| P2 | Done | Topic enhancements | Wildcard (`*`) topics, hierarchical `prefix.*` patterns, and a dead-event hook for publishes that reach no subscriber |
+| P2 | Partial | Integration examples | `net/http` example shipped; Gin, CLI apps, and workers remain |
 | P3 | Planned | Broker bridges | Borrow from Watermill and explore NATS / Kafka / RabbitMQ adapters, preferably in separate subpackages |
 | P3 | Planned | Mediator mode | Borrow from MediatR and add request / response, command, query, and notification support only if needed |
 | P4 | Planned | Stateful features | Evaluate sticky events, event replay, and local persistence only when there is a clear use case |

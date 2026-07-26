@@ -6,22 +6,27 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
 
 // EventBus - box for handlers and callbacks.
 type EventBus[T any] struct {
-	handlers      map[string][]*eventHandler[T]
-	middlewares   []EventMiddleware[any]
-	errorHandler  ErrorHandler
-	metrics       Metrics
-	logger        Logger
-	lock          sync.RWMutex
-	wg            sync.WaitGroup
-	closed        bool
-	closeCh       chan struct{}
-	nextHandlerID uint64
+	handlers map[string][]*eventHandler[T]
+	// patternTopics tracks the handler-map keys that are patterns ("*" or a
+	// trailing ".*"), so a publish only scans patterns instead of every topic.
+	patternTopics    map[string]struct{}
+	middlewares      []EventMiddleware[any]
+	errorHandler     ErrorHandler
+	deadEventHandler DeadEventHandler[T]
+	metrics          Metrics
+	logger           Logger
+	lock             sync.RWMutex
+	wg               sync.WaitGroup
+	closed           bool
+	closeCh          chan struct{}
+	nextHandlerID    uint64
 }
 
 // Option defines a functional option for EventBus
@@ -61,17 +66,26 @@ func WithMiddleware[T any](middleware EventMiddleware[any]) Option[T] {
 	}
 }
 
+// WithDeadEventHandler sets a handler for events published to a topic with no
+// subscribed handlers.
+func WithDeadEventHandler[T any](handler DeadEventHandler[T]) Option[T] {
+	return func(b *EventBus[T]) {
+		b.deadEventHandler = handler
+	}
+}
+
 // NewTyped returns new EventBus with empty handlers for the specified type.
 func NewTyped[T any](opts ...Option[T]) *EventBus[T] {
 	b := &EventBus[T]{
-		handlers:    make(map[string][]*eventHandler[T]),
-		middlewares: make([]EventMiddleware[any], 0),
-		metrics:     &DefaultMetrics{},
-		logger:      NewDefaultLogger(),
-		lock:        sync.RWMutex{},
-		wg:          sync.WaitGroup{},
-		closed:      false,
-		closeCh:     make(chan struct{}),
+		handlers:      make(map[string][]*eventHandler[T]),
+		patternTopics: make(map[string]struct{}),
+		middlewares:   make([]EventMiddleware[any], 0),
+		metrics:       &DefaultMetrics{},
+		logger:        NewDefaultLogger(),
+		lock:          sync.RWMutex{},
+		wg:            sync.WaitGroup{},
+		closed:        false,
+		closeCh:       make(chan struct{}),
 	}
 	for _, opt := range opts {
 		if opt == nil {
@@ -93,6 +107,10 @@ func New(opts ...Option[any]) *EventBus[any] {
 // Subscribe registers fn for topic and returns a handle that cancels the
 // subscription. Behavior is configured through HandlerOption values; with no
 // options the handler runs synchronously at PriorityNormal.
+//
+// Topic may be a pattern: "*" receives every event, and a trailing ".*"
+// receives every topic under a prefix — "user.*" matches "user.created" and
+// "user.created.eu" but not "user" itself.
 //
 // Subscribe reports why a subscription was rejected: a nil handler, a filter
 // whose event type does not match the bus, or a closed bus. On error the
@@ -159,6 +177,9 @@ func (bus *EventBus[T]) Subscribe(topic string, fn Handler[T], options ...Handle
 		handlers = append(handlers, handler)
 	}
 	bus.handlers[topic] = handlers
+	if isPatternTopic(topic) {
+		bus.patternTopics[topic] = struct{}{}
+	}
 	bus.metrics.IncrementSubscribers()
 
 	if bus.logger != nil {
@@ -166,6 +187,25 @@ func (bus *EventBus[T]) Subscribe(topic string, fn Handler[T], options ...Handle
 	}
 
 	return &Handle[T]{bus: bus, topic: topic, handler: handler}, nil
+}
+
+// isPatternTopic reports whether topic subscribes to a pattern rather than a
+// single topic.
+func isPatternTopic(topic string) bool {
+	return topic == "*" || strings.HasSuffix(topic, ".*")
+}
+
+// topicMatchesPattern reports whether pattern captures topic. "*" matches
+// every topic; "prefix.*" matches every topic strictly under "prefix.".
+func topicMatchesPattern(pattern, topic string) bool {
+	if pattern == "*" {
+		return true
+	}
+	prefix, ok := strings.CutSuffix(pattern, ".*")
+	if !ok {
+		return false
+	}
+	return len(topic) > len(prefix)+1 && strings.HasPrefix(topic, prefix+".")
 }
 
 func (bus *EventBus[T]) prepareHandlerLocked(topic string, handler *eventHandler[T]) {
@@ -210,16 +250,27 @@ func (bus *EventBus[T]) PublishWithContext(ctx context.Context, topic string, ev
 	}
 	logger := bus.logger
 	errorHandler := bus.errorHandler
+	deadEventHandler := bus.deadEventHandler
 	metrics := bus.metrics
 	closeCh := bus.closeCh
 	handlers := append([]*eventHandler[T](nil), bus.handlers[topic]...)
-	if topic != "*" {
-		if wildcardHandlers := bus.handlers["*"]; len(wildcardHandlers) > 0 {
-			handlers = append(handlers, wildcardHandlers...)
-			sort.SliceStable(handlers, func(i, j int) bool {
-				return handlers[i].priority > handlers[j].priority
-			})
+	// Merge handlers subscribed to matching patterns. Pattern names are
+	// sorted so that same-priority handlers from different patterns keep a
+	// deterministic order across publishes.
+	var patterns []string
+	for pattern := range bus.patternTopics {
+		if pattern != topic && topicMatchesPattern(pattern, topic) {
+			patterns = append(patterns, pattern)
 		}
+	}
+	if len(patterns) > 0 {
+		sort.Strings(patterns)
+		for _, pattern := range patterns {
+			handlers = append(handlers, bus.handlers[pattern]...)
+		}
+		sort.SliceStable(handlers, func(i, j int) bool {
+			return handlers[i].priority > handlers[j].priority
+		})
 	}
 	middlewares := append([]EventMiddleware[any](nil), bus.middlewares...)
 	bus.lock.RUnlock()
@@ -232,6 +283,10 @@ func (bus *EventBus[T]) PublishWithContext(ctx context.Context, topic string, ev
 	metrics.IncrementPublished()
 	if detailed, ok := metrics.(DetailedMetrics); ok {
 		detailed.RecordPublished(topic)
+	}
+
+	if len(handlers) == 0 && deadEventHandler != nil {
+		deadEventHandler(topic, event)
 	}
 
 	dispatch := func() error {
@@ -502,6 +557,7 @@ func (bus *EventBus[T]) removeHandler(topic string, target *eventHandler[T]) boo
 		bus.handlers[topic] = bus.handlers[topic][:l-1]
 		if len(bus.handlers[topic]) == 0 {
 			delete(bus.handlers, topic)
+			delete(bus.patternTopics, topic)
 		}
 		bus.metrics.DecrementSubscribers()
 
@@ -529,6 +585,14 @@ func (bus *EventBus[T]) SetErrorHandler(handler ErrorHandler) {
 	bus.lock.Lock()
 	defer bus.lock.Unlock()
 	bus.errorHandler = handler
+}
+
+// SetDeadEventHandler sets a handler for events published to a topic with no
+// subscribed handlers (including pattern subscribers). Pass nil to remove it.
+func (bus *EventBus[T]) SetDeadEventHandler(handler DeadEventHandler[T]) {
+	bus.lock.Lock()
+	defer bus.lock.Unlock()
+	bus.deadEventHandler = handler
 }
 
 // AddMiddleware adds middleware to the bus
@@ -595,6 +659,7 @@ func (bus *EventBus[T]) Close() error {
 		subscriberCount += len(handlers)
 	}
 	bus.handlers = make(map[string][]*eventHandler[T])
+	bus.patternTopics = make(map[string]struct{})
 	bus.lock.Unlock()
 
 	// Wait for all async operations to complete

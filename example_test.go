@@ -159,6 +159,47 @@ func ExampleEventBus_AddMiddleware() {
 	// after job.run
 }
 
+// A trailing ".*" subscribes to every topic under a prefix: "orders.*"
+// matches "orders.created" and "orders.created.eu", but not "orders" itself.
+func ExampleEventBus_Subscribe_hierarchical() {
+	b := bus.NewTyped[string]()
+	defer b.Close()
+
+	b.Subscribe("orders.*", func(ctx context.Context, payload string) error {
+		fmt.Println("orders event:", payload)
+		return nil
+	})
+
+	b.Publish("orders.created", "o-1")
+	b.Publish("orders.created.eu", "o-2")
+	b.Publish("orders", "ignored") // the prefix itself does not match
+	b.Publish("invoices.created", "ignored")
+
+	// Output:
+	// orders event: o-1
+	// orders event: o-2
+}
+
+// A dead-event handler observes publishes that reached no subscriber at all —
+// usually a misspelled topic.
+func ExampleEventBus_SetDeadEventHandler() {
+	b := bus.NewTyped[string]()
+	defer b.Close()
+
+	b.SetDeadEventHandler(func(topic string, event string) {
+		fmt.Printf("dead event on %q: %s\n", topic, event)
+	})
+	b.Subscribe("user.created", func(ctx context.Context, event string) error {
+		return nil
+	})
+
+	b.Publish("user.created", "delivered") // has a subscriber: no dead event
+	b.Publish("user.craeted", "u-1")       // typo: nobody subscribed
+
+	// Output:
+	// dead event on "user.craeted": u-1
+}
+
 // The "*" topic receives every event. Wildcard handlers are merged with the
 // topic's own handlers and ordered by priority.
 func ExampleEventBus_Subscribe_wildcard() {
