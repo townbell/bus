@@ -4,7 +4,7 @@
 
 ## 环境要求
 
-- Go 1.19 或更高版本
+- Go 1.21 或更高版本
 - 所有示例使用 `//go:build ignore` 来避免运行 `go test ./...` 时发生冲突
 - 示例必须单独运行，使用 `go run filename.go`
 
@@ -197,7 +197,7 @@ paymentBus.Subscribe("payment.failed", func(payment Payment) {
 
 1. **构建错误**: 如果遇到 "main redeclared" 错误，确保使用 `go run filename.go` 而不是 `go run .`
 2. **导入错误**: 确保你的项目有正确的 `go.mod` 文件
-3. **版本兼容性**: 确保使用 Go 1.19 或更高版本
+3. **版本兼容性**: 确保使用 Go 1.21 或更高版本
 
 ### 调试技巧
 

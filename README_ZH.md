@@ -7,11 +7,12 @@
 </p>
 
 
-[![Go Version](https://img.shields.io/badge/go-%3E%3D1.19-blue.svg)](https://golang.org/)
+[![CI](https://github.com/townbell/bus/actions/workflows/ci.yml/badge.svg)](https://github.com/townbell/bus/actions/workflows/ci.yml)
+[![Go Version](https://img.shields.io/badge/go-%3E%3D1.21-blue.svg)](https://golang.org/)
 [![Go Reference](https://pkg.go.dev/badge/github.com/townbell/bus.svg)](https://pkg.go.dev/github.com/townbell/bus)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Go Report Card](https://goreportcard.com/badge/github.com/townbell/bus)](https://goreportcard.com/report/github.com/townbell/bus)
-[![Coverage](https://img.shields.io/badge/coverage-91.2%25-brightgreen.svg)](https://github.com/townbell/bus)
+[![Coverage](https://img.shields.io/badge/coverage-93.3%25-brightgreen.svg)](https://github.com/townbell/bus/actions/workflows/ci.yml)
 
 
 
@@ -49,6 +50,13 @@ import "github.com/townbell/bus" // 包名为 bus
 
 ```bash
 go get github.com/townbell/bus
+```
+
+核心模块**没有任何依赖**，引入它只会带进标准库。可选的 Prometheus 适配器是独立模块，
+只有你主动安装时 `client_golang` 才会进入你的构建：
+
+```bash
+go get github.com/townbell/bus/prometheus
 ```
 
 ## 🚀 快速开始
@@ -271,6 +279,7 @@ handle, err := eventBus.SubscribeWithOptions("payment.validate", func(event Paym
 - middleware 必须调用 `next()` 才会继续执行后续 middleware 和 handler；不调用 `next()` 可用于拦截事件。
 - `SubscribeOnce` / `SubscribeOnceAsync` 的 handler 只会成功执行一次，即使同一 topic 下有多个一次性 handler。
 - `Close` 后不再接受新发布或订阅；已启动的异步 handler 会在关闭流程中等待完成。
+- 只返回 `*Handle[T]` 的订阅方法在订阅被拒绝时（callback 为 nil，或 bus 已关闭）会返回 `nil`。`nil` handle 可以安全使用：`Unsubscribe` 返回错误、`IsActive` 返回 `false`，因此 `defer handle.Unsubscribe()` 不会 panic。需要知道拒绝原因时请用 `SubscribeWithOptions`。
 
 ## 🗺️ RoadMap
 
@@ -283,6 +292,12 @@ Townbell 会优先保持“进程内、类型安全、轻量事件总线”的�
 | P1 | 已完成 | 文档对齐 | README 已补充当前 P1 能力和示例 |
 | P1 | 已完成 | 可观测性 | 已提供 topic / handler 维度的发布数、处理数、失败数、耗时统计，并提供可选 Prometheus 适配 |
 | P1 | 已完成 | 执行控制 | `SubscribeWithOptions` 支持 handler 级 timeout、recover 策略、异步/串行执行和最大并发数 |
+| P1 | 已完成 | 持续集成 | GitHub Actions 在 Go 版本矩阵上执行 build、vet、race 测试、gofmt 门禁和覆盖率下限，并显式 vet `example/` |
+| P1 | 已完成 | 核心零依赖 | Prometheus 适配器拆为独立模块，引入 `bus` 只会带进标准库 |
+| P1 | 已完成 | 可执行文档 | godoc `Example` 函数在 CI 中带输出校验执行，并展示在 pkg.go.dev 上 |
+| P0 | 未完成 | 订阅 API 收敛 | 目前并存三种签名：只返回 `error`、只返回 `*Handle[T]`、返回 `(*Handle[T], error)`。应统一到最后一种。属破坏性变更，是 v1.0.0 的前置条件 |
+| P0 | 未完成 | handler 错误上报 | handler 是 `func(T)`，业务失败除了 panic 无法上报，导致 `ErrorHandler` 实际只能收到 panic 和 timeout。属破坏性变更，是 v1.0.0 的前置条件，同时解锁返回值收集 |
+| P0 | 未完成 | `Publish` 错误语义 | 定案 `Publish` 是返回 error，还是把"丢弃错误"确立为永久契约。v1.0.0 的前置条件 |
 | P2 | 未完成 | 返回值收集 | 参考 Blinker，提供 `PublishCollect` 一类 API，收集多个 handler 的返回值或错误 |
 | P2 | 部分完成 | Topic 增强 | 通配符（`*`）topic 已实现；层级 topic、无订阅者事件 hook 仍待开发 |
 | P2 | 未完成 | 集成示例 | 补充 `net/http`、Gin、CLI、worker 等实际项目中的使用方式 |
@@ -453,21 +468,27 @@ eventBus.SubscribeWithFilter("user.activity", handler, func(topic string, event 
 
 ## 🧪 测试
 
-运行完整测试套件：
+运行完整测试套件。Prometheus 适配器是独立模块，需要单独执行：
 
 ```bash
-go test -v ./...
+go test -race ./...
+(cd prometheus && go test -race ./...)
+```
+
+`example/` 下的文件带有 `//go:build ignore`，`go vet ./...` 会跳过它们，需要逐个显式指定：
+
+```bash
+for f in example/*.go; do go vet "$f"; done
 ```
 
 生成测试覆盖率报告：
 
 ```bash
-go test -cover ./...
 go test -coverprofile=coverage.out ./...
 go tool cover -html=coverage.out -o coverage.html
 ```
 
-**当前测试覆盖率：91.2%**（全模块口径，`go test -coverprofile ./...`）- 我们保持高测试覆盖率以确保可靠性和稳定性。
+**当前覆盖率：核心模块 93.3%**，Prometheus 适配器 79.7%。CI 对核心模块设了 90% 的下限门槛，这个数字不会再悄悄漂移。
 
 运行性能测试：
 
@@ -477,12 +498,29 @@ go test -bench=. -benchmem
 
 ## 📈 性能
 
-基于 Go 1.19+ 的基准测试结果：
+测试环境：Apple M5（10 核）、Go 1.22.12、darwin/arm64，测量日期 2026-07-26。
+所有基准测试都使用 `b.RunParallel`，因此 `ns/op` 是全部核心上的聚合成本，不是单
+goroutine 延迟。
 
-- **同步发布**: ~2,000,000 events/sec
-- **异步发布**: ~5,000,000 events/sec
-- **内存使用**: 极低的 GC 压力
-- **并发性能**: 优秀的多核扩展性
+| 基准测试 | ns/op | B/op | allocs/op |
+| --- | --- | --- | --- |
+| `SyncPublish`（1 个订阅者） | 839 | 392 | 11 |
+| `AsyncPublish`（1 个订阅者） | 1320 | 520 | 12 |
+| `MultipleSubscribers` | 4470 | 752 | 29 |
+| `WithPriority` | 532 | 472 | 15 |
+| `WithFilter` | 240 | 376 | 10 |
+| `ConcurrentSubscribeUnsubscribe` | 3613 | 1207 | 38 |
+| `ChannelBaseline`（裸 Go channel） | 50 | 0 | 0 |
+
+这张表里有两点值得注意：
+
+- **异步发布比同步发布慢，而不是快。** 每次异步派发都要启动 goroutine，并操作
+  `WaitGroup` 和互斥锁。选择异步是为了把慢 handler 挪出发布 goroutine，不是为了
+  提高吞吐。
+- **裸 channel 大约便宜 17 倍。** 事件总线换来的是扇出、优先级、过滤器、中间件和
+  监控指标；如果你只需要把一个值交给某个已知的 goroutine，channel 才是更合适的工具。
+
+不同硬件上的数字会有差异。请自己重跑基准测试，不要直接采信这张表。
 
 ## 🤝 贡献
 
