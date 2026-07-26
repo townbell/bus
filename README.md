@@ -12,7 +12,7 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/townbell/bus.svg)](https://pkg.go.dev/github.com/townbell/bus)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Go Report Card](https://goreportcard.com/badge/github.com/townbell/bus)](https://goreportcard.com/report/github.com/townbell/bus)
-[![Coverage](https://img.shields.io/badge/coverage-93.3%25-brightgreen.svg)](https://github.com/townbell/bus/actions/workflows/ci.yml)
+[![Coverage](https://img.shields.io/badge/coverage-95.5%25-brightgreen.svg)](https://github.com/townbell/bus/actions/workflows/ci.yml)
 
 
 
@@ -238,6 +238,16 @@ eventBus.SetErrorHandler(func(err *bus.EventError) {
 })
 ```
 
+Recovered panics arrive as `*bus.PanicError`, so they can be told apart from
+ordinary handler errors:
+
+```go
+var pe *bus.PanicError
+if errors.As(err, &pe) {
+    log.Printf("handler panicked with %v", pe.Value)
+}
+```
+
 ### Middleware
 
 Add processing middleware:
@@ -345,7 +355,7 @@ Available options: `HandlerPriority`, `HandlerFilter`, `HandlerContext`,
 - A handler error does not stop dispatch: the remaining handlers still run. Dispatch stops early only when the publish context is canceled, the bus closes, or a handler panics under `RecoverAndStop`.
 - Synchronous handlers run in the goroutine that calls publish and receive a context derived from the publish call; asynchronous handlers run in separate goroutines and receive the subscription context (`HandlerContext`), and `HandlerAsync(true)` serializes calls to the same handler.
 - `HandlerTimeout` bounds how long the publish call waits and cancels the handler's context when it elapses; a handler that ignores its context keeps running in the background and is still awaited by `WaitAsync` and `Close`.
-- Handler panics are recovered, counted as failures, and reported through `ErrorHandler`; `RecoverAndContinue` (the default) keeps dispatching, `RecoverAndStop` aborts the publish call. Either way the recovered panic appears in the publish error.
+- Handler panics are recovered as `*PanicError`, counted as failures, and reported through `ErrorHandler`; `RecoverAndContinue` (the default) keeps dispatching, `RecoverAndStop` aborts the publish call. Either way the recovered panic appears in the publish error and is detectable with `errors.As`.
 - Middleware must call `next()` to continue to the next middleware and handlers; skipping `next()` intercepts the event.
 - `HandlerOnce` handlers execute successfully at most once, including when multiple one-time handlers share a topic.
 - After `Close`, the bus rejects new publish and subscribe calls; already-started async handlers are allowed to finish.
@@ -560,7 +570,7 @@ go test -coverprofile=coverage.out ./...
 go tool cover -html=coverage.out -o coverage.html
 ```
 
-**Current coverage: 93.3%** for the core module, 79.7% for the Prometheus
+**Current coverage: 95.5%** for the core module, 79.7% for the Prometheus
 adapter. CI enforces a 90% floor on the core module, so this figure cannot
 silently drift.
 
@@ -572,29 +582,35 @@ go test -bench=. -benchmem
 
 ## 📈 Performance
 
-Measured on an Apple M5 (10 cores), Go 1.22.12, darwin/arm64, on 2026-07-26.
-Every benchmark uses `b.RunParallel`, so `ns/op` is the aggregate cost across
-all cores rather than single-goroutine latency.
+Measured on an Apple M5 (10 cores), Go 1.22.12, darwin/arm64, on 2026-07-27
+(v0.8.0). Every benchmark uses `b.RunParallel`, so `ns/op` is the aggregate
+cost across all cores rather than single-goroutine latency.
 
 | Benchmark | ns/op | B/op | allocs/op |
 | --- | --- | --- | --- |
-| `SyncPublish` (1 subscriber) | 839 | 392 | 11 |
-| `AsyncPublish` (1 subscriber) | 1320 | 520 | 12 |
-| `MultipleSubscribers` | 4470 | 752 | 29 |
-| `WithPriority` | 532 | 472 | 15 |
-| `WithFilter` | 240 | 376 | 10 |
-| `ConcurrentSubscribeUnsubscribe` | 3613 | 1207 | 38 |
-| `ChannelBaseline` (raw Go channel) | 50 | 0 | 0 |
+| `SyncPublish` (1 subscriber) | 350 | 0 | 0 |
+| `AsyncPublish` (1 subscriber) | 784 | 128 | 1 |
+| `MultipleSubscribers` (10 subscribers) | 2580 | 0 | 0 |
+| `WithPriority` | 254 | 0 | 0 |
+| `WithFilter` | 63 | 0 | 0 |
+| `ConcurrentSubscribeUnsubscribe` | 2964 | 713 | 14 |
+| `ChannelBaseline` (raw Go channel) | 49 | 0 | 0 |
 
-Two things are worth reading off this table:
+**Synchronous publishing allocates nothing.** Handler lists are copy-on-write:
+subscription changes build fresh slices, so a publish uses the current list
+directly instead of copying it, and the middleware machinery and debug logging
+are skipped entirely when unused. v0.8.0 cut a sync publish from 839 ns and
+11 allocations to 350 ns and zero.
+
+Two more things worth reading off this table:
 
 - **Asynchronous publishing is slower than synchronous publishing**, not faster.
   Every async dispatch starts a goroutine and touches a `WaitGroup` and a mutex.
   Reach for async to keep a slow handler off the publishing goroutine, not to
   raise throughput.
-- **A raw channel is roughly 17x cheaper.** The bus buys you fan-out,
-  priorities, filters, middleware and metrics. If all you need is to hand a
-  value to one known goroutine, a channel is the better tool.
+- **A raw channel is still cheaper** — about 2x on a single goroutine. The bus
+  buys you fan-out, priorities, filters, middleware and metrics. If all you
+  need is to hand a value to one known goroutine, a channel is the better tool.
 
 Numbers on your hardware will differ. Re-run the benchmarks rather than trusting
 this table.

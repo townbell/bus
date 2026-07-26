@@ -2,6 +2,7 @@ package bus
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -53,7 +54,11 @@ type handlerMetrics struct {
 	totalDuration   time.Duration
 }
 
-// DefaultMetrics is the default implementation of the Metrics interface
+// DefaultMetrics is the default implementation of the Metrics interface.
+//
+// The counter fields are updated atomically and sit on the publish hot path;
+// read them through GetStats rather than directly. The mutex guards only the
+// per-topic and per-handler maps.
 type DefaultMetrics struct {
 	PublishedEvents   int64
 	ProcessedEvents   int64
@@ -67,44 +72,30 @@ type DefaultMetrics struct {
 var _ DetailedMetrics = (*DefaultMetrics)(nil)
 
 func (m *DefaultMetrics) IncrementPublished() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.ensureMaps()
-	m.PublishedEvents++
+	atomic.AddInt64(&m.PublishedEvents, 1)
 }
 
 func (m *DefaultMetrics) IncrementProcessed() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.ensureMaps()
-	m.ProcessedEvents++
+	atomic.AddInt64(&m.ProcessedEvents, 1)
 }
 
 func (m *DefaultMetrics) IncrementFailed() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.ensureMaps()
-	m.FailedEvents++
+	atomic.AddInt64(&m.FailedEvents, 1)
 }
 
 func (m *DefaultMetrics) IncrementSubscribers() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.ensureMaps()
-	m.ActiveSubscribers++
+	atomic.AddInt32(&m.ActiveSubscribers, 1)
 }
 
 func (m *DefaultMetrics) DecrementSubscribers() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.ensureMaps()
-	m.ActiveSubscribers--
+	atomic.AddInt32(&m.ActiveSubscribers, -1)
 }
 
 func (m *DefaultMetrics) GetStats() (published, processed, failed int64, activeSubscribers int32) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.PublishedEvents, m.ProcessedEvents, m.FailedEvents, m.ActiveSubscribers
+	return atomic.LoadInt64(&m.PublishedEvents),
+		atomic.LoadInt64(&m.ProcessedEvents),
+		atomic.LoadInt64(&m.FailedEvents),
+		atomic.LoadInt32(&m.ActiveSubscribers)
 }
 
 // RecordPublished records a published event for a topic.
