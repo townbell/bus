@@ -1,6 +1,6 @@
-# Go EventBus Examples
+# Townbell Examples
 
-This directory contains comprehensive examples demonstrating the features and capabilities of the go-bus library.
+This directory contains comprehensive examples demonstrating the features and capabilities of the Townbell library.
 
 [中文文档](README_ZH.md)
 

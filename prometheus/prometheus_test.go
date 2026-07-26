@@ -3,9 +3,9 @@ package prometheus
 import (
 	"testing"
 
-	bus "github.com/PlutoWu-Cn/go-bus"
 	client "github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	bus "github.com/townbell/bus"
 )
 
 func TestMetricsImplementsBusMetrics(t *testing.T) {

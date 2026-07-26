@@ -7,7 +7,7 @@ import (
 	"log"
 	"time"
 
-	"github.com/PlutoWu-Cn/go-bus"
+	"github.com/townbell/bus"
 )
 
 // Event represents a generic event

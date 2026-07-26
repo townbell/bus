@@ -1,6 +1,6 @@
-# Go EventBus 示例
+# Townbell 示例
 
-这个目录包含了展示 go-bus 库功能和特性的全面示例。
+这个目录包含了展示 Townbell 库功能和特性的全面示例。
 
 ## 环境要求
 

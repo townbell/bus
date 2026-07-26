@@ -31,4 +31,4 @@ type EventFilter[T any] func(topic string, event T) bool
 type EventMiddleware[T any] func(topic string, event T, next func()) error
 
 // ErrorHandler defines how to handle errors during event processing
-type ErrorHandler func(err *EventError) 
+type ErrorHandler func(err *EventError)

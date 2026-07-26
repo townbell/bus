@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/PlutoWu-Cn/go-bus"
+	"github.com/townbell/bus"
 )
 
 // Event represents a basic event structure
@@ -24,7 +24,7 @@ type UserAction struct {
 }
 
 func main() {
-	fmt.Println("=== Go EventBus Basic Usage Examples ===\n")
+	fmt.Println("=== Townbell Basic Usage Examples ===")
 
 	// Example 1: Basic publish and subscribe
 	basicExample()

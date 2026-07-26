@@ -7,7 +7,7 @@ import (
 	"log"
 	"time"
 
-	"github.com/PlutoWu-Cn/go-bus"
+	"github.com/townbell/bus"
 )
 
 // Order represents an e-commerce order

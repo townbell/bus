@@ -3,8 +3,8 @@ package prometheus
 import (
 	"time"
 
-	bus "github.com/PlutoWu-Cn/go-bus"
 	client "github.com/prometheus/client_golang/prometheus"
+	bus "github.com/townbell/bus"
 )
 
 // Config controls Prometheus metric names and registration.

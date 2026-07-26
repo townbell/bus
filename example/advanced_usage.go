@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/PlutoWu-Cn/go-bus"
+	"github.com/townbell/bus"
 )
 
 // UserEvent represents a user action event
