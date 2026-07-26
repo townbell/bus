@@ -7,7 +7,7 @@ require (
 	// Must be v0.5.0 or newer. Up to and including v0.4.0 the root module still
 	// bundled this package, so an older requirement makes the import path
 	// ambiguous: it would be provided by two modules at once.
-	github.com/townbell/bus v0.5.0
+	github.com/townbell/bus v0.6.0
 )
 
 // v0.5.0 required github.com/townbell/bus v0.4.0, which still contains this
