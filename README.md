@@ -1,21 +1,25 @@
 <p align="center">
-  <img src="assets/icon.png" alt="Go-Bus Icon" width="120">
+  <img src="assets/icon.png" alt="Townbell Bus Icon" width="120">
 </p>
-<h1 align="center">Go-Bus</h1>
+<h1 align="center">Townbell Bus</h1>
 <p align="center">
   <strong>A High-Performance Event-Driven Architecture Library for Go</strong>
 </p>
 
 
 [![Go Version](https://img.shields.io/badge/go-%3E%3D1.19-blue.svg)](https://golang.org/)
-[![Go Reference](https://pkg.go.dev/badge/github.com/PlutoWu-Cn/go-bus.svg)](https://pkg.go.dev/github.com/PlutoWu-Cn/go-bus)
+[![Go Reference](https://pkg.go.dev/badge/github.com/townbell/bus.svg)](https://pkg.go.dev/github.com/townbell/bus)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Go Report Card](https://goreportcard.com/badge/github.com/PlutoWu-Cn/go-bus)](https://goreportcard.com/report/github.com/PlutoWu-Cn/go-bus)
-[![Coverage](https://img.shields.io/badge/coverage-92.3%25-brightgreen.svg)](https://github.com/PlutoWu-Cn/go-bus)
+[![Go Report Card](https://goreportcard.com/badge/github.com/townbell/bus)](https://goreportcard.com/report/github.com/townbell/bus)
+[![Coverage](https://img.shields.io/badge/coverage-91.2%25-brightgreen.svg)](https://github.com/townbell/bus)
 
 
 
 A modern, high-performance Go event bus implementation with type safety, async processing, priority handling, filters, and enterprise-grade features.
+
+```go
+import "github.com/townbell/bus" // package bus
+```
 
 [中文文档](README_ZH.md)
 
@@ -44,7 +48,7 @@ A modern, high-performance Go event bus implementation with type safety, async p
 ## 📦 Installation
 
 ```bash
-go get github.com/PlutoWu-Cn/go-bus
+go get github.com/townbell/bus
 ```
 
 ## 🚀 Quick Start
@@ -56,7 +60,7 @@ package main
 
 import (
     "fmt"
-    "github.com/PlutoWu-Cn/go-bus"
+    "github.com/townbell/bus"
 )
 
 type UserEvent struct {
@@ -221,7 +225,7 @@ if detailed, ok := eventBus.GetMetrics().(*bus.DefaultMetrics); ok {
 Prometheus integration is available as an optional subpackage:
 
 ```go
-import busprom "github.com/PlutoWu-Cn/go-bus/prometheus"
+import busprom "github.com/townbell/bus/prometheus"
 
 promMetrics := busprom.New(busprom.Config{})
 eventBus := bus.NewTyped[UserEvent](
@@ -270,7 +274,7 @@ handle, err := eventBus.SubscribeWithOptions("payment.validate", func(event Paym
 
 ## 🗺️ RoadMap
 
-Go-Bus will keep its focus on being an in-process, type-safe, lightweight event bus. Future work may borrow ideas from Watermill, Blinker, MediatR, and Guava EventBus, but the core package will not try to become a full distributed messaging system.
+Townbell will keep its focus on being an in-process, type-safe, lightweight event bus. Future work may borrow ideas from Watermill, Blinker, MediatR, and Guava EventBus, but the core package will not try to become a full distributed messaging system.
 
 | Priority | Status | Area | Notes |
 | --- | --- | --- | --- |
@@ -280,7 +284,7 @@ Go-Bus will keep its focus on being an in-process, type-safe, lightweight event 
 | P1 | Done | Observability | Per-topic and per-handler published, processed, failed, and duration metrics are available, with an optional Prometheus adapter |
 | P1 | Done | Execution control | `SubscribeWithOptions` supports handler-level timeout, recover policy, async/serial execution, and max concurrency |
 | P2 | Planned | Result collection | Borrow from Blinker and add a `PublishCollect`-style API for collecting handler results or errors |
-| P2 | Planned | Topic enhancements | Add wildcard topics, hierarchical topics, and no-subscriber hooks for routing and debugging |
+| P2 | Partial | Topic enhancements | Wildcard (`*`) topics are implemented; hierarchical topics and no-subscriber hooks are still planned |
 | P2 | Planned | Integration examples | Add practical examples for `net/http`, Gin, CLI apps, and workers |
 | P3 | Planned | Broker bridges | Borrow from Watermill and explore NATS / Kafka / RabbitMQ adapters, preferably in separate subpackages |
 | P3 | Planned | Mediator mode | Borrow from MediatR and add request / response, command, query, and notification support only if needed |
@@ -436,7 +440,7 @@ eventBus.SubscribeWithFilter("user.activity", handler, func(topic string, event 
 
 ## 🔍 Comparison with Other Libraries
 
-| Feature | go-bus | Guava EventBus | RxJava | Node.js EventEmitter |
+| Feature | Townbell | Guava EventBus | RxJava | Node.js EventEmitter |
 |---------|---------|----------------|---------|---------------------|
 | Type Safety | ✅ Generics | ✅ | ✅ | ❌ |
 | Async Processing | ✅ | ❌ | ✅ | ✅ |
@@ -463,7 +467,7 @@ go test -coverprofile=coverage.out ./...
 go tool cover -html=coverage.out -o coverage.html
 ```
 
-**Current test coverage: 92.3%** - We maintain high test coverage to ensure reliability and stability.
+**Current test coverage: 91.2%** (whole module, `go test -coverprofile ./...`) - We maintain high test coverage to ensure reliability and stability.
 
 Run performance benchmarks:
 

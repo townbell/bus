@@ -1,21 +1,25 @@
 <p align="center">
-  <img src="assets/icon.png" alt="Go-Bus Icon" width="120">
+  <img src="assets/icon.png" alt="Townbell Bus Icon" width="120">
 </p>
-<h1 align="center">Go-Bus</h1>
+<h1 align="center">Townbell Bus</h1>
 <p align="center">
   <strong>一个高性能、支持泛型的 Go 事件驱动架构库</strong>
 </p>
 
 
 [![Go Version](https://img.shields.io/badge/go-%3E%3D1.19-blue.svg)](https://golang.org/)
-[![Go Reference](https://pkg.go.dev/badge/github.com/PlutoWu-Cn/go-bus.svg)](https://pkg.go.dev/github.com/PlutoWu-Cn/go-bus)
+[![Go Reference](https://pkg.go.dev/badge/github.com/townbell/bus.svg)](https://pkg.go.dev/github.com/townbell/bus)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Go Report Card](https://goreportcard.com/badge/github.com/PlutoWu-Cn/go-bus)](https://goreportcard.com/report/github.com/PlutoWu-Cn/go-bus)
-[![Coverage](https://img.shields.io/badge/coverage-92.3%25-brightgreen.svg)](https://github.com/PlutoWu-Cn/go-bus)
+[![Go Report Card](https://goreportcard.com/badge/github.com/townbell/bus)](https://goreportcard.com/report/github.com/townbell/bus)
+[![Coverage](https://img.shields.io/badge/coverage-91.2%25-brightgreen.svg)](https://github.com/townbell/bus)
 
 
 
 一个现代化的、高性能的 Go 事件总线实现，支持泛型、异步处理、优先级、过滤器等企业级功能。
+
+```go
+import "github.com/townbell/bus" // 包名为 bus
+```
 
 [English Documentation](README.md)
 
@@ -44,7 +48,7 @@
 ## 📦 安装
 
 ```bash
-go get github.com/PlutoWu-Cn/go-bus
+go get github.com/townbell/bus
 ```
 
 ## 🚀 快速开始
@@ -56,7 +60,7 @@ package main
 
 import (
     "fmt"
-    "github.com/PlutoWu-Cn/go-bus"
+    "github.com/townbell/bus"
 )
 
 type UserEvent struct {
@@ -221,7 +225,7 @@ if detailed, ok := eventBus.GetMetrics().(*bus.DefaultMetrics); ok {
 Prometheus 集成放在可选子包中：
 
 ```go
-import busprom "github.com/PlutoWu-Cn/go-bus/prometheus"
+import busprom "github.com/townbell/bus/prometheus"
 
 promMetrics := busprom.New(busprom.Config{})
 eventBus := bus.NewTyped[UserEvent](
@@ -270,7 +274,7 @@ handle, err := eventBus.SubscribeWithOptions("payment.validate", func(event Paym
 
 ## 🗺️ RoadMap
 
-Go-Bus 会优先保持“进程内、类型安全、轻量事件总线”的定位。后续迭代会参考 Watermill、Blinker、MediatR、Guava EventBus 等项目，但不会把核心库扩成完整的分布式消息系统。
+Townbell 会优先保持“进程内、类型安全、轻量事件总线”的定位。后续迭代会参考 Watermill、Blinker、MediatR、Guava EventBus 等项目，但不会把核心库扩成完整的分布式消息系统。
 
 | 优先级 | 是否已完成 | 方向 | 说明 |
 | --- | --- | --- | --- |
@@ -280,7 +284,7 @@ Go-Bus 会优先保持“进程内、类型安全、轻量事件总线”的定�
 | P1 | 已完成 | 可观测性 | 已提供 topic / handler 维度的发布数、处理数、失败数、耗时统计，并提供可选 Prometheus 适配 |
 | P1 | 已完成 | 执行控制 | `SubscribeWithOptions` 支持 handler 级 timeout、recover 策略、异步/串行执行和最大并发数 |
 | P2 | 未完成 | 返回值收集 | 参考 Blinker，提供 `PublishCollect` 一类 API，收集多个 handler 的返回值或错误 |
-| P2 | 未完成 | Topic 增强 | 支持通配符 topic、层级 topic、无订阅者事件 hook，提升路由和调试能力 |
+| P2 | 部分完成 | Topic 增强 | 通配符（`*`）topic 已实现；层级 topic、无订阅者事件 hook 仍待开发 |
 | P2 | 未完成 | 集成示例 | 补充 `net/http`、Gin、CLI、worker 等实际项目中的使用方式 |
 | P3 | 未完成 | Broker 桥接 | 参考 Watermill，探索 NATS / Kafka / RabbitMQ 适配器；优先放在独立子包，避免拖重核心库 |
 | P3 | 未完成 | Mediator 模式 | 参考 MediatR，按需提供 request / response、command、query、notification 子包 |
@@ -436,7 +440,7 @@ eventBus.SubscribeWithFilter("user.activity", handler, func(topic string, event 
 
 ## 🔍 与其他库的对比
 
-| 特性 | go-bus | Guava EventBus | RxJava | Node.js EventEmitter |
+| 特性 | Townbell | Guava EventBus | RxJava | Node.js EventEmitter |
 |------|---------|----------------|---------|---------------------|
 | 类型安全 | ✅ 泛型 | ✅ | ✅ | ❌ |
 | 异步处理 | ✅ | ❌ | ✅ | ✅ |
@@ -463,7 +467,7 @@ go test -coverprofile=coverage.out ./...
 go tool cover -html=coverage.out -o coverage.html
 ```
 
-**当前测试覆盖率：92.3%** - 我们保持高测试覆盖率以确保可靠性和稳定性。
+**当前测试覆盖率：91.2%**（全模块口径，`go test -coverprofile ./...`）- 我们保持高测试覆盖率以确保可靠性和稳定性。
 
 运行性能测试：
 
