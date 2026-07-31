@@ -191,3 +191,119 @@ func TestDefaultMetricsDetailedSnapshots(t *testing.T) {
 		t.Fatalf("Expected handler processed=1 failed=1, got processed=%d failed=%d", handlerStats.ProcessedEvents, handlerStats.FailedEvents)
 	}
 }
+
+func TestDetailedHandlerMetricsAreRemovedWithSubscription(t *testing.T) {
+	bus := NewTyped[string]()
+	defer bus.Close()
+
+	handle := mustSubscribe(t, bus, "orders.created", discard[string])
+	if err := bus.Publish("orders.created", "o-1"); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+
+	detailed := bus.GetMetrics().(*DefaultMetrics)
+	if got := len(detailed.GetHandlerStats()); got != 1 {
+		t.Fatalf("Expected one handler metric before unsubscribe, got %d", got)
+	}
+	if err := handle.Unsubscribe(); err != nil {
+		t.Fatalf("Unsubscribe: %v", err)
+	}
+	if got := len(detailed.GetHandlerStats()); got != 0 {
+		t.Fatalf("Expected handler metrics to be removed after unsubscribe, got %d", got)
+	}
+}
+
+func TestDetailedHandlerMetricsAreRemovedAfterOnceDelivery(t *testing.T) {
+	bus := NewTyped[string]()
+	defer bus.Close()
+
+	mustSubscribe(t, bus, "orders.once", discard[string], HandlerOnce())
+	if err := bus.Publish("orders.once", "o-1"); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+
+	detailed := bus.GetMetrics().(*DefaultMetrics)
+	if got := len(detailed.GetHandlerStats()); got != 0 {
+		t.Fatalf("Expected once handler metrics to be removed, got %d", got)
+	}
+}
+
+func TestDetailedHandlerMetricsAreRemovedOnClose(t *testing.T) {
+	bus := NewTyped[string]()
+	mustSubscribe(t, bus, "orders.close", discard[string])
+	if err := bus.Publish("orders.close", "o-1"); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+
+	detailed := bus.GetMetrics().(*DefaultMetrics)
+	if got := len(detailed.GetHandlerStats()); got != 1 {
+		t.Fatalf("Expected one handler metric before Close, got %d", got)
+	}
+	if err := bus.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if got := len(detailed.GetHandlerStats()); got != 0 {
+		t.Fatalf("Expected handler metrics to be removed after Close, got %d", got)
+	}
+}
+
+func TestDetailedTopicMetricsSurviveInFlightUnsubscribe(t *testing.T) {
+	bus := NewTyped[string]()
+	defer bus.Close()
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	handle := mustSubscribe(t, bus, "orders.unsubscribe", func(context.Context, string) error {
+		close(started)
+		<-release
+		return nil
+	}, HandlerAsync(false))
+	if err := bus.Publish("orders.unsubscribe", "o-1"); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	<-started
+	if err := handle.Unsubscribe(); err != nil {
+		t.Fatalf("Unsubscribe: %v", err)
+	}
+	close(release)
+	bus.WaitAsync()
+
+	detailed := bus.GetMetrics().(*DefaultMetrics)
+	if got := detailed.GetTopicStats()["orders.unsubscribe"].ProcessedEvents; got != 1 {
+		t.Fatalf("Expected one topic metric after in-flight unsubscribe, got %d", got)
+	}
+	if got := len(detailed.GetHandlerStats()); got != 0 {
+		t.Fatalf("Expected handler metrics to be removed after unsubscribe, got %d", got)
+	}
+}
+
+func TestDetailedTopicMetricsSurviveInFlightClose(t *testing.T) {
+	bus := NewTyped[string]()
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	mustSubscribe(t, bus, "orders.close-in-flight", func(context.Context, string) error {
+		close(started)
+		<-release
+		return nil
+	}, HandlerAsync(false))
+	if err := bus.Publish("orders.close-in-flight", "o-1"); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	<-started
+
+	closed := make(chan error, 1)
+	go func() { closed <- bus.Close() }()
+	close(release)
+	if err := <-closed; err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	detailed := bus.GetMetrics().(*DefaultMetrics)
+	if got := detailed.GetTopicStats()["orders.close-in-flight"].ProcessedEvents; got != 1 {
+		t.Fatalf("Expected one topic metric after in-flight Close, got %d", got)
+	}
+	if got := len(detailed.GetHandlerStats()); got != 0 {
+		t.Fatalf("Expected handler metrics to be removed after Close, got %d", got)
+	}
+}

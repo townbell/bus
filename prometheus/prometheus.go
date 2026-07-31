@@ -33,6 +33,7 @@ type Metrics struct {
 }
 
 var _ bus.DetailedMetrics = (*Metrics)(nil)
+var _ bus.HandlerMetricsCleaner = (*Metrics)(nil)
 
 // New creates a Prometheus-backed metrics collector.
 func New(config Config) *Metrics {
@@ -200,4 +201,14 @@ func (m *Metrics) GetTopicStats() map[string]bus.TopicMetricsSnapshot {
 
 func (m *Metrics) GetHandlerStats() map[string]bus.HandlerMetricsSnapshot {
 	return m.base.GetHandlerStats()
+}
+
+// RemoveHandlerMetrics removes metric series for an inactive subscription.
+// Aggregate topic and global metrics remain available.
+func (m *Metrics) RemoveHandlerMetrics(topic, handlerID string) {
+	m.base.RemoveHandlerMetrics(topic, handlerID)
+	m.processedHandle.DeleteLabelValues(topic, handlerID)
+	m.failedHandle.DeleteLabelValues(topic, handlerID)
+	m.duration.DeleteLabelValues(topic, handlerID, "success")
+	m.duration.DeleteLabelValues(topic, handlerID, "failed")
 }

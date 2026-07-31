@@ -2,6 +2,7 @@ package bus
 
 import (
 	"context"
+	"sync"
 	"testing"
 )
 
@@ -67,4 +68,30 @@ func TestHandleUnsubscribeIsIdempotent(t *testing.T) {
 	if err := handle.Unsubscribe(); err == nil {
 		t.Error("second Unsubscribe returned no error")
 	}
+}
+
+func TestHandleUnsubscribeConcurrentWithSetLogger(t *testing.T) {
+	bus := NewTyped[string](WithLogger[string](NewNoOpLogger()))
+	defer bus.Close()
+	handle := mustSubscribe(t, bus, "topic", discard[string])
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := 0; i < 100; i++ {
+			bus.SetLogger(NewNoOpLogger())
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := 0; i < 100; i++ {
+			_ = handle.Unsubscribe()
+		}
+	}()
+	close(start)
+	wg.Wait()
 }

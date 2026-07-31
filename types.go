@@ -49,7 +49,10 @@ type DeadEventHandler[T any] func(topic string, event T)
 // EventFilter allows filtering events before they reach handlers
 type EventFilter[T any] func(topic string, event T) bool
 
-// EventMiddleware allows intercepting events before and after processing
+// EventMiddleware allows intercepting events before and after processing.
+//
+// A middleware that wants dispatch to continue must call next before it
+// returns. Calling next after the middleware returns is ignored.
 type EventMiddleware[T any] func(topic string, event T, next func()) error
 
 // ErrorHandler defines how to handle errors during event processing

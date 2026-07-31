@@ -8,10 +8,13 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
-// EventBus - box for handlers and callbacks.
+// EventBus dispatches events to topic subscribers.
+//
+// EventBus is safe for concurrent use by multiple goroutines.
 type EventBus[T any] struct {
 	handlers map[string][]*eventHandler[T]
 	// patternTopics tracks the handler-map keys that are patterns ("*" or a
@@ -26,8 +29,11 @@ type EventBus[T any] struct {
 	wg               sync.WaitGroup
 	closed           bool
 	closeCh          chan struct{}
-	nextHandlerID    uint64
 }
+
+// handlerIDSequence gives handler metrics a process-wide identity. This keeps
+// per-handler Prometheus series distinct when several buses share a registry.
+var handlerIDSequence atomic.Uint64
 
 // Option defines a functional option for EventBus
 type Option[T any] func(*EventBus[T])
@@ -117,7 +123,7 @@ func New(opts ...Option[any]) *EventBus[any] {
 // returned handle is nil; a nil handle is still safe to use.
 func (bus *EventBus[T]) Subscribe(topic string, fn Handler[T], options ...HandlerOption) (*Handle[T], error) {
 	if fn == nil {
-		return nil, fmt.Errorf("event handler is nil")
+		return nil, ErrNilHandler
 	}
 
 	opts := defaultHandlerOptions()
@@ -153,12 +159,13 @@ func (bus *EventBus[T]) Subscribe(topic string, fn Handler[T], options ...Handle
 		maxConcurrency: opts.maxConcurrency,
 		Mutex:          sync.Mutex{},
 	}
+	handler.active.Store(true)
 
 	bus.lock.Lock()
 	defer bus.lock.Unlock()
 
 	if bus.closed {
-		return nil, fmt.Errorf("event bus is closed")
+		return nil, ErrBusClosed
 	}
 	bus.prepareHandlerLocked(topic, handler)
 
@@ -211,20 +218,23 @@ func topicMatchesPattern(pattern, topic string) bool {
 }
 
 func (bus *EventBus[T]) prepareHandlerLocked(topic string, handler *eventHandler[T]) {
-	bus.nextHandlerID++
-	handler.id = topic + "#" + strconv.FormatUint(bus.nextHandlerID, 10)
+	handler.id = topic + "#" + strconv.FormatUint(handlerIDSequence.Add(1), 10)
 	if handler.maxConcurrency > 0 && handler.concurrency == nil {
 		handler.concurrency = make(chan struct{}, handler.maxConcurrency)
 	}
 }
 
-// HasCallback returns true if exists any callback subscribed to the topic.
+// HasCallback reports whether topic has an exact or matching-pattern subscription.
 func (bus *EventBus[T]) HasCallback(topic string) bool {
 	bus.lock.RLock()
 	defer bus.lock.RUnlock()
-	_, ok := bus.handlers[topic]
-	if ok {
-		return len(bus.handlers[topic]) > 0
+	if len(bus.handlers[topic]) > 0 {
+		return true
+	}
+	for pattern := range bus.patternTopics {
+		if topicMatchesPattern(pattern, topic) && len(bus.handlers[pattern]) > 0 {
+			return true
+		}
 	}
 	return false
 }
@@ -267,7 +277,7 @@ func (bus *EventBus[T]) PublishCollectWithContext(ctx context.Context, topic str
 	bus.lock.RLock()
 	if bus.closed {
 		bus.lock.RUnlock()
-		return []error{fmt.Errorf("event bus is closed")}
+		return []error{ErrBusClosed}
 	}
 	logger := bus.logger
 	errorHandler := bus.errorHandler
@@ -350,13 +360,23 @@ func runMiddlewares(middlewares []EventMiddleware[any], topic string, event any,
 			dispatchErrs = dispatch()
 			return
 		}
-		var nextOnce sync.Once
+		var nextMu sync.Mutex
+		nextCalled := false
+		middlewareReturned := false
 		next := func() {
-			nextOnce.Do(func() {
-				run(i + 1)
-			})
+			nextMu.Lock()
+			defer nextMu.Unlock()
+			if middlewareReturned || nextCalled {
+				return
+			}
+			nextCalled = true
+			run(i + 1)
 		}
-		if err := middlewares[i](topic, event, next); err != nil {
+		err := middlewares[i](topic, event, next)
+		nextMu.Lock()
+		middlewareReturned = true
+		nextMu.Unlock()
+		if err != nil {
 			middlewareErr = err
 		}
 	}
@@ -372,7 +392,7 @@ func (bus *EventBus[T]) dispatchCollect(ctx context.Context, topic string, event
 		case <-ctx.Done():
 			return append(errs, ctx.Err())
 		case <-closeCh:
-			return append(errs, fmt.Errorf("event bus is closed"))
+			return append(errs, ErrBusClosed)
 		default:
 		}
 
@@ -404,7 +424,7 @@ func (bus *EventBus[T]) dispatchCollect(ctx context.Context, topic string, event
 		}
 
 		if !bus.addAsync() {
-			return append(errs, fmt.Errorf("event bus is closed"))
+			return append(errs, ErrBusClosed)
 		}
 		if handler.transactional {
 			handler.Lock()
@@ -459,6 +479,7 @@ func (bus *EventBus[T]) doPublish(ctx context.Context, closeCh <-chan struct{}, 
 		ctx = context.Background()
 	}
 
+	bus.beginHandlerMetrics(handler)
 	start := time.Now()
 	err := bus.runHandler(ctx, closeCh, handler, event)
 	duration := time.Since(start)
@@ -468,9 +489,7 @@ func (bus *EventBus[T]) doPublish(ctx context.Context, closeCh <-chan struct{}, 
 			logger.Debug("Handler executed successfully for topic '%s'", topic)
 		}
 		metrics.IncrementProcessed()
-		if detailed, ok := metrics.(DetailedMetrics); ok {
-			detailed.RecordProcessed(topic, handler.id, duration)
-		}
+		bus.recordHandlerMetrics(metrics, handler, topic, duration, false)
 		return nil, false
 	}
 
@@ -492,9 +511,7 @@ func (bus *EventBus[T]) doPublish(ctx context.Context, closeCh <-chan struct{}, 
 		})
 	}
 	metrics.IncrementFailed()
-	if detailed, ok := metrics.(DetailedMetrics); ok {
-		detailed.RecordFailed(topic, handler.id, duration)
-	}
+	bus.recordHandlerMetrics(metrics, handler, topic, duration, true)
 	return err, isPanic && handler.recoverPolicy == RecoverAndStop
 }
 
@@ -505,7 +522,7 @@ func (bus *EventBus[T]) runHandler(ctx context.Context, closeCh <-chan struct{},
 	}
 
 	if !bus.addAsync() {
-		return fmt.Errorf("event bus is closed")
+		return ErrBusClosed
 	}
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -530,7 +547,7 @@ func (bus *EventBus[T]) runHandler(ctx context.Context, closeCh <-chan struct{},
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-closeCh:
-		return fmt.Errorf("event bus is closed")
+		return ErrBusClosed
 	}
 }
 
@@ -562,7 +579,7 @@ func acquireConcurrency[T any](ctx context.Context, closeCh <-chan struct{}, han
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-closeCh:
-		return fmt.Errorf("event bus is closed")
+		return ErrBusClosed
 	}
 }
 
@@ -585,9 +602,9 @@ func (bus *EventBus[T]) doPublishAsync(handler *eventHandler[T], topic string, e
 
 func (bus *EventBus[T]) removeHandler(topic string, target *eventHandler[T]) bool {
 	bus.lock.Lock()
-	defer bus.lock.Unlock()
 
 	if _, ok := bus.handlers[topic]; !ok {
+		bus.lock.Unlock()
 		return false
 	}
 
@@ -595,6 +612,7 @@ func (bus *EventBus[T]) removeHandler(topic string, target *eventHandler[T]) boo
 		if handler != target {
 			continue
 		}
+		target.active.Store(false)
 		// Copy-on-write: build a fresh slice so publishes holding the old one
 		// keep a consistent view without copying on their hot path.
 		old := bus.handlers[topic]
@@ -613,9 +631,48 @@ func (bus *EventBus[T]) removeHandler(topic string, target *eventHandler[T]) boo
 		if bus.logger != nil {
 			bus.logger.Debug("Handler removed from topic '%s'", topic)
 		}
+		bus.lock.Unlock()
+		bus.removeHandlerMetrics(target)
 		return true
 	}
+	bus.lock.Unlock()
 	return false
+}
+
+func (bus *EventBus[T]) beginHandlerMetrics(handler *eventHandler[T]) {
+	handler.metricsMu.Lock()
+	defer handler.metricsMu.Unlock()
+	handler.metricsInFlight++
+}
+
+func (bus *EventBus[T]) recordHandlerMetrics(metrics Metrics, handler *eventHandler[T], topic string, duration time.Duration, failed bool) {
+	handler.metricsMu.Lock()
+	defer handler.metricsMu.Unlock()
+
+	if detailed, ok := metrics.(DetailedMetrics); ok {
+		if failed {
+			detailed.RecordFailed(topic, handler.id, duration)
+		} else {
+			detailed.RecordProcessed(topic, handler.id, duration)
+		}
+	}
+	handler.metricsInFlight--
+	if handler.metricsCleanupPending && handler.metricsInFlight == 0 {
+		if cleaner, ok := metrics.(HandlerMetricsCleaner); ok {
+			cleaner.RemoveHandlerMetrics(handler.topic, handler.id)
+		}
+	}
+}
+
+func (bus *EventBus[T]) removeHandlerMetrics(handler *eventHandler[T]) {
+	handler.metricsMu.Lock()
+	defer handler.metricsMu.Unlock()
+	handler.metricsCleanupPending = true
+	if handler.metricsInFlight == 0 {
+		if cleaner, ok := bus.metrics.(HandlerMetricsCleaner); ok {
+			cleaner.RemoveHandlerMetrics(handler.topic, handler.id)
+		}
+	}
 }
 
 // WaitAsync waits for all async callbacks to complete
@@ -668,7 +725,7 @@ func (bus *EventBus[T]) GetLogger() Logger {
 	return bus.logger
 }
 
-// GetTopics returns all topics that have subscribers
+// GetTopics returns all topics that have subscribers in lexical order.
 func (bus *EventBus[T]) GetTopics() []string {
 	bus.lock.RLock()
 	defer bus.lock.RUnlock()
@@ -677,6 +734,7 @@ func (bus *EventBus[T]) GetTopics() []string {
 	for topic := range bus.handlers {
 		topics = append(topics, topic)
 	}
+	sort.Strings(topics)
 	return topics
 }
 
@@ -697,18 +755,27 @@ func (bus *EventBus[T]) Close() error {
 
 	if bus.closed {
 		bus.lock.Unlock()
-		return fmt.Errorf("event bus already closed")
+		return fmt.Errorf("%w: already closed", ErrBusClosed)
 	}
 
 	bus.closed = true
 	close(bus.closeCh)
 	subscriberCount := 0
+	removedHandlers := make([]*eventHandler[T], 0)
 	for _, handlers := range bus.handlers {
 		subscriberCount += len(handlers)
+		for _, handler := range handlers {
+			handler.active.Store(false)
+			removedHandlers = append(removedHandlers, handler)
+		}
 	}
 	bus.handlers = make(map[string][]*eventHandler[T])
 	bus.patternTopics = make(map[string]struct{})
 	bus.lock.Unlock()
+
+	for _, handler := range removedHandlers {
+		bus.removeHandlerMetrics(handler)
+	}
 
 	// Wait for all async operations to complete
 	bus.wg.Wait()

@@ -283,6 +283,23 @@ func TestLoggerConcurrency(t *testing.T) {
 	}
 }
 
+func TestDefaultLoggerLevelConcurrency(t *testing.T) {
+	logger := NewDefaultLogger()
+	var wg sync.WaitGroup
+
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				logger.SetLevel(LogLevel((i + j) % 4))
+				_ = logger.GetLevel()
+			}
+		}(i)
+	}
+	wg.Wait()
+}
+
 func BenchmarkEventBusWithLogger(b *testing.B) {
 	eventBus := NewTyped[string]()
 	eventBus.SetLogger(NewDefaultLogger())
