@@ -587,6 +587,31 @@ func TestMiddlewareNextIsConcurrentSafe(t *testing.T) {
 	}
 }
 
+func TestMiddlewareNextAfterReturnIsIgnored(t *testing.T) {
+	bus := NewTyped[TestEvent]()
+	defer bus.Close()
+
+	nexts := make(chan func(), 1)
+	var handlerCalled int32
+	bus.AddMiddleware(func(topic string, event interface{}, next func()) error {
+		nexts <- next
+		return nil
+	})
+	mustSubscribe(t, bus, "middleware.next.late", func(ctx context.Context, event TestEvent) error {
+		atomic.AddInt32(&handlerCalled, 1)
+		return nil
+	})
+
+	if err := bus.Publish("middleware.next.late", TestEvent{ID: "test", Value: 1}); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	(<-nexts)()
+
+	if count := atomic.LoadInt32(&handlerCalled); count != 0 {
+		t.Fatalf("Expected late next to be ignored, got %d handler calls", count)
+	}
+}
+
 func TestPublishDoesNotHoldBusLockDuringHandler(t *testing.T) {
 	bus := NewTyped[TestEvent]()
 	defer bus.Close()
@@ -886,6 +911,23 @@ func TestHandleUnsubscribe(t *testing.T) {
 	}
 }
 
+func TestHandleBecomesInactiveAfterOnceDelivery(t *testing.T) {
+	bus := NewTyped[TestEvent]()
+	defer bus.Close()
+
+	handle := mustSubscribe(t, bus, "once.handle", discard[TestEvent], HandlerOnce())
+	if err := bus.Publish("once.handle", TestEvent{ID: "once"}); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+
+	if handle.IsActive() {
+		t.Fatal("once handle should be inactive after delivery")
+	}
+	if err := handle.Unsubscribe(); !errors.Is(err, ErrSubscriptionInactive) {
+		t.Fatalf("Unsubscribe error = %v, want ErrSubscriptionInactive", err)
+	}
+}
+
 func TestBusClose(t *testing.T) {
 	bus := NewTyped[TestEvent]()
 
@@ -906,8 +948,8 @@ func TestBusClose(t *testing.T) {
 	}
 
 	// Try to publish again (should fail)
-	if err := bus.PublishWithContext(context.Background(), "close.test", TestEvent{ID: "after_close", Value: 2}); err == nil {
-		t.Error("Expected error when publishing to closed bus")
+	if err := bus.PublishWithContext(context.Background(), "close.test", TestEvent{ID: "after_close", Value: 2}); !errors.Is(err, ErrBusClosed) {
+		t.Errorf("Publish error = %v, want ErrBusClosed", err)
 	}
 
 	// Try to subscribe (should fail)
@@ -916,8 +958,23 @@ func TestBusClose(t *testing.T) {
 	}
 
 	// Closing again should return error
-	if err := bus.Close(); err == nil {
-		t.Error("Expected error when closing already closed bus")
+	if err := bus.Close(); !errors.Is(err, ErrBusClosed) {
+		t.Errorf("second Close error = %v, want ErrBusClosed", err)
+	}
+}
+
+func TestHandleBecomesInactiveAfterClose(t *testing.T) {
+	bus := NewTyped[TestEvent]()
+	handle := mustSubscribe(t, bus, "close.handle", discard[TestEvent])
+
+	if err := bus.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if handle.IsActive() {
+		t.Fatal("handle should be inactive after Close")
+	}
+	if err := handle.Unsubscribe(); !errors.Is(err, ErrSubscriptionInactive) {
+		t.Fatalf("Unsubscribe error = %v, want ErrSubscriptionInactive", err)
 	}
 }
 
@@ -1301,6 +1358,19 @@ func TestHasCallback(t *testing.T) {
 	}
 }
 
+func TestHasCallbackMatchesPatternSubscriptions(t *testing.T) {
+	bus := NewTyped[TestEvent]()
+	defer bus.Close()
+
+	mustSubscribe(t, bus, "orders.*", discard[TestEvent])
+	if !bus.HasCallback("orders.created") {
+		t.Fatal("expected matching pattern subscription")
+	}
+	if bus.HasCallback("orders") {
+		t.Fatal("pattern must not match its prefix topic")
+	}
+}
+
 // TestGetTopics tests the GetTopics function
 func TestGetTopics(t *testing.T) {
 	bus := NewTyped[TestEvent]()
@@ -1325,6 +1395,11 @@ func TestGetTopics(t *testing.T) {
 	topics = bus.GetTopics()
 	if len(topics) != 3 {
 		t.Errorf("Expected 3 topics, got %d", len(topics))
+	}
+	for i, expected := range []string{"topic1", "topic2", "topic3"} {
+		if topics[i] != expected {
+			t.Fatalf("Expected sorted topics %v, got %v", []string{"topic1", "topic2", "topic3"}, topics)
+		}
 	}
 
 	// Check if all topics are present

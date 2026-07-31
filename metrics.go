@@ -24,6 +24,14 @@ type DetailedMetrics interface {
 	RecordFailed(topic, handlerID string, duration time.Duration)
 }
 
+// HandlerMetricsCleaner is an optional Metrics extension for discarding
+// per-handler data when a subscription becomes inactive.
+//
+// Implementations should retain aggregate topic and global metrics.
+type HandlerMetricsCleaner interface {
+	RemoveHandlerMetrics(topic, handlerID string)
+}
+
 // TopicMetricsSnapshot is a read-only copy of metrics for a topic.
 type TopicMetricsSnapshot struct {
 	PublishedEvents int64
@@ -70,6 +78,7 @@ type DefaultMetrics struct {
 }
 
 var _ DetailedMetrics = (*DefaultMetrics)(nil)
+var _ HandlerMetricsCleaner = (*DefaultMetrics)(nil)
 
 func (m *DefaultMetrics) IncrementPublished() {
 	atomic.AddInt64(&m.PublishedEvents, 1)
@@ -166,6 +175,13 @@ func (m *DefaultMetrics) GetHandlerStats() map[string]HandlerMetricsSnapshot {
 		}
 	}
 	return result
+}
+
+// RemoveHandlerMetrics discards per-handler metrics for an inactive subscription.
+func (m *DefaultMetrics) RemoveHandlerMetrics(_ string, handlerID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.handlerMetrics, handlerID)
 }
 
 func (m *DefaultMetrics) ensureMaps() {

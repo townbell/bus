@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -21,21 +22,26 @@ type Handle[T any] struct {
 // error from Subscribe and deferring Unsubscribe stays safe.
 func (h *Handle[T]) Unsubscribe() error {
 	if h == nil {
-		return fmt.Errorf("handle is nil: the subscription was never created")
+		return ErrNilHandle
 	}
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
 	if h.handler == nil {
-		return fmt.Errorf("handle already unsubscribed")
+		return ErrSubscriptionInactive
+	}
+	if !h.handler.active.Load() {
+		h.handler = nil
+		return ErrSubscriptionInactive
 	}
 
-	if h.bus.logger != nil {
-		h.bus.logger.Debug("Unsubscribing handler from topic '%s'", h.topic)
+	if logger := h.bus.GetLogger(); logger != nil {
+		logger.Debug("Unsubscribing handler from topic '%s'", h.topic)
 	}
 	if !h.bus.removeHandler(h.topic, h.handler) {
-		return fmt.Errorf("handler not found for topic %s", h.topic)
+		h.handler = nil
+		return fmt.Errorf("%w: handler not found for topic %s", ErrSubscriptionInactive, h.topic)
 	}
 	h.handler = nil
 
@@ -51,23 +57,27 @@ func (h *Handle[T]) IsActive() bool {
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	return h.handler != nil
+	return h.handler != nil && h.handler.active.Load()
 }
 
 // eventHandler represents an internal event handler
 type eventHandler[T any] struct {
-	id             string
-	topic          string
-	callBack       Handler[T]
-	flagOnce       bool
-	async          bool
-	transactional  bool
-	priority       Priority
-	filter         EventFilter[T]
-	ctx            context.Context
-	timeout        time.Duration
-	recoverPolicy  RecoverPolicy
-	maxConcurrency int
-	concurrency    chan struct{}
-	sync.Mutex     // lock for an event handler - useful for running async callbacks serially
+	id                    string
+	topic                 string
+	callBack              Handler[T]
+	flagOnce              bool
+	async                 bool
+	transactional         bool
+	priority              Priority
+	filter                EventFilter[T]
+	ctx                   context.Context
+	timeout               time.Duration
+	recoverPolicy         RecoverPolicy
+	maxConcurrency        int
+	concurrency           chan struct{}
+	active                atomic.Bool
+	metricsMu             sync.Mutex
+	metricsInFlight       int
+	metricsCleanupPending bool
+	sync.Mutex            // lock for an event handler - useful for running async callbacks serially
 }
