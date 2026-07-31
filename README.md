@@ -158,8 +158,16 @@ Available options: `HandlerPriority`, `HandlerFilter`, `HandlerContext`,
 | ✅ | v0.6 API convergence | One options-based `Subscribe`; error-returning handlers and publishing |
 | ✅ | v0.8 publish hot path | Copy-on-write handler snapshots and zero-allocation synchronous publishing |
 | ✅ | v0.9 result collection | `PublishCollect` exposes individual synchronous delivery failures |
-| 🚧 | P2 integration examples | `net/http` and local worker examples are available; Gin and CLI guides remain |
-| Planned | P3+ | Optional broker bridges, mediator mode, and stateful features — outside the core module |
+| ✅ | v0.11 P2 integration examples | Runnable Gin service and standard-library CLI lifecycle guide |
+| Planned | v1.0 API freeze | Audit preview contracts, settle any compatibility feedback, then freeze the core API and migration guidance |
+| Planned | P3 broker bridge | Design one transport-specific adapter as a separate module; define delivery, retry, and shutdown semantics before code |
+| Planned | P4 mediator mode | Validate a concrete application use case and publish it as an optional package, not a `Bus` concern |
+| Planned | P5 stateful capability | Keep state, persistence, and recovery outside the core; require a separate design proposal and ownership model |
+
+The ordered path after v0.11 is API-freeze readiness, then v1.0. P3–P5 are
+intentionally optional modules: each needs a dedicated proposal, explicit
+dependency and delivery guarantees, and its own release cadence before work
+starts. None should add a runtime dependency to the core module.
 
 ## Quality and performance
 
