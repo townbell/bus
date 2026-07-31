@@ -234,13 +234,32 @@ func (bus *EventBus[T]) HasCallback(topic string) bool {
 // delivery failures do not matter to the caller. Asynchronous handler
 // failures are reported through the ErrorHandler instead.
 func (bus *EventBus[T]) Publish(topic string, event T) error {
-	return bus.PublishWithContext(context.Background(), topic, event)
+	return errors.Join(bus.PublishCollect(topic, event)...)
 }
 
 // PublishWithContext publishes an event with context. Canceling the context
 // aborts dispatch to the remaining handlers and cancels the context passed to
 // the currently running synchronous handler.
 func (bus *EventBus[T]) PublishWithContext(ctx context.Context, topic string, event T) error {
+	return errors.Join(bus.PublishCollectWithContext(ctx, topic, event)...)
+}
+
+// PublishCollect publishes an event and returns each synchronous dispatch
+// failure in handler execution order. It includes errors caused by context
+// cancellation, closing the bus, and middleware. Asynchronous handler
+// failures remain available through ErrorHandler only, because they may occur
+// after this method returns.
+//
+// A nil result means no synchronous dispatch failure occurred. The result is
+// independent of future publishes and may be inspected or retained by the
+// caller.
+func (bus *EventBus[T]) PublishCollect(topic string, event T) []error {
+	return bus.PublishCollectWithContext(context.Background(), topic, event)
+}
+
+// PublishCollectWithContext is PublishCollect with a caller-provided context.
+// A nil context is treated as context.Background.
+func (bus *EventBus[T]) PublishCollectWithContext(ctx context.Context, topic string, event T) []error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -248,7 +267,7 @@ func (bus *EventBus[T]) PublishWithContext(ctx context.Context, topic string, ev
 	bus.lock.RLock()
 	if bus.closed {
 		bus.lock.RUnlock()
-		return fmt.Errorf("event bus is closed")
+		return []error{fmt.Errorf("event bus is closed")}
 	}
 	logger := bus.logger
 	errorHandler := bus.errorHandler
@@ -301,13 +320,13 @@ func (bus *EventBus[T]) PublishWithContext(ctx context.Context, topic string, ev
 	// Fast path: with no middleware there is no reason to box the event into
 	// any or allocate the chain closures.
 	if len(middlewares) == 0 {
-		return bus.dispatch(ctx, topic, event, handlers, closeCh, logger, debugLog, errorHandler, metrics)
+		return bus.dispatchCollect(ctx, topic, event, handlers, closeCh, logger, debugLog, errorHandler, metrics)
 	}
 
-	dispatch := func() error {
-		return bus.dispatch(ctx, topic, event, handlers, closeCh, logger, debugLog, errorHandler, metrics)
+	dispatch := func() []error {
+		return bus.dispatchCollect(ctx, topic, event, handlers, closeCh, logger, debugLog, errorHandler, metrics)
 	}
-	dispatchErr, middlewareErr := runMiddlewares(middlewares, topic, event, dispatch)
+	dispatchErrs, middlewareErr := runMiddlewares(middlewares, topic, event, dispatch)
 	if middlewareErr != nil {
 		if errorHandler != nil {
 			errorHandler(&EventError{
@@ -316,19 +335,19 @@ func (bus *EventBus[T]) PublishWithContext(ctx context.Context, topic string, ev
 				Err:   middlewareErr,
 			})
 		}
-		return middlewareErr
+		return []error{middlewareErr}
 	}
-	return dispatchErr
+	return dispatchErrs
 }
 
-func runMiddlewares(middlewares []EventMiddleware[any], topic string, event any, dispatch func() error) (dispatchErr, middlewareErr error) {
+func runMiddlewares(middlewares []EventMiddleware[any], topic string, event any, dispatch func() []error) (dispatchErrs []error, middlewareErr error) {
 	var run func(int)
 	run = func(i int) {
 		if middlewareErr != nil {
 			return
 		}
 		if i == len(middlewares) {
-			dispatchErr = dispatch()
+			dispatchErrs = dispatch()
 			return
 		}
 		var nextOnce sync.Once
@@ -342,18 +361,18 @@ func runMiddlewares(middlewares []EventMiddleware[any], topic string, event any,
 		}
 	}
 	run(0)
-	return dispatchErr, middlewareErr
+	return dispatchErrs, middlewareErr
 }
 
-func (bus *EventBus[T]) dispatch(ctx context.Context, topic string, event T, handlers []*eventHandler[T], closeCh <-chan struct{}, logger Logger, debugLog bool, errorHandler ErrorHandler, metrics Metrics) error {
+func (bus *EventBus[T]) dispatchCollect(ctx context.Context, topic string, event T, handlers []*eventHandler[T], closeCh <-chan struct{}, logger Logger, debugLog bool, errorHandler ErrorHandler, metrics Metrics) []error {
 	var errs []error
 
 	for _, handler := range handlers {
 		select {
 		case <-ctx.Done():
-			return errors.Join(append(errs, ctx.Err())...)
+			return append(errs, ctx.Err())
 		case <-closeCh:
-			return errors.Join(append(errs, fmt.Errorf("event bus is closed"))...)
+			return append(errs, fmt.Errorf("event bus is closed"))
 		default:
 		}
 
@@ -379,20 +398,20 @@ func (bus *EventBus[T]) dispatch(ctx context.Context, topic string, event T, han
 				errs = append(errs, err)
 			}
 			if stop {
-				return errors.Join(errs...)
+				return errs
 			}
 			continue
 		}
 
 		if !bus.addAsync() {
-			return errors.Join(append(errs, fmt.Errorf("event bus is closed"))...)
+			return append(errs, fmt.Errorf("event bus is closed"))
 		}
 		if handler.transactional {
 			handler.Lock()
 		}
 		go bus.doPublishAsync(handler, topic, event, closeCh, logger, debugLog, errorHandler, metrics)
 	}
-	return errors.Join(errs...)
+	return errs
 }
 
 func (bus *EventBus[T]) addAsync() bool {
@@ -407,9 +426,15 @@ func (bus *EventBus[T]) addAsync() bool {
 
 // PublishWithTimeout publishes an event with timeout
 func (bus *EventBus[T]) PublishWithTimeout(topic string, event T, timeout time.Duration) error {
+	return errors.Join(bus.PublishCollectWithTimeout(topic, event, timeout)...)
+}
+
+// PublishCollectWithTimeout is PublishCollect with a timeout. A timeout is
+// reported as context.DeadlineExceeded in the returned errors.
+func (bus *EventBus[T]) PublishCollectWithTimeout(topic string, event T, timeout time.Duration) []error {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	return bus.PublishWithContext(ctx, topic, event)
+	return bus.PublishCollectWithContext(ctx, topic, event)
 }
 
 // PanicError wraps a value recovered from a panicking handler. It reaches the

@@ -343,6 +343,99 @@ func TestAsyncHandlerErrorGoesToErrorHandler(t *testing.T) {
 	}
 }
 
+func TestPublishCollectReturnsSynchronousErrorsInDispatchOrder(t *testing.T) {
+	bus := NewTyped[TestEvent]()
+	defer bus.Close()
+	bus.SetLogger(NewNoOpLogger())
+
+	errFirst := errors.New("first failure")
+	errSecond := errors.New("second failure")
+	errAsync := errors.New("async failure")
+	reported := make(chan error, 3)
+	bus.SetErrorHandler(func(eventErr *EventError) {
+		reported <- eventErr.Err
+	})
+
+	mustSubscribe(t, bus, "errors.collect", func(ctx context.Context, event TestEvent) error {
+		return errFirst
+	}, HandlerPriority(PriorityHigh))
+	mustSubscribe(t, bus, "errors.collect", func(ctx context.Context, event TestEvent) error {
+		return errSecond
+	}, HandlerPriority(PriorityNormal))
+	mustSubscribe(t, bus, "errors.collect", func(ctx context.Context, event TestEvent) error {
+		return errAsync
+	}, HandlerAsync(false), HandlerPriority(PriorityLow))
+
+	errs := bus.PublishCollect("errors.collect", TestEvent{ID: "collect", Value: 1})
+	if len(errs) != 2 {
+		t.Fatalf("Expected 2 synchronous errors, got %d: %v", len(errs), errs)
+	}
+	if !errors.Is(errs[0], errFirst) || !errors.Is(errs[1], errSecond) {
+		t.Fatalf("Expected dispatch-ordered errors [%v, %v], got %v", errFirst, errSecond, errs)
+	}
+
+	bus.WaitAsync()
+	for _, want := range []error{errFirst, errSecond, errAsync} {
+		select {
+		case got := <-reported:
+			if !errors.Is(got, want) {
+				t.Fatalf("Expected ErrorHandler error %v, got %v", want, got)
+			}
+		default:
+			t.Fatalf("Expected ErrorHandler to receive %v", want)
+		}
+	}
+}
+
+func TestPublishCollectReportsContextCancellationAfterPriorErrors(t *testing.T) {
+	bus := NewTyped[TestEvent]()
+	defer bus.Close()
+	bus.SetLogger(NewNoOpLogger())
+
+	errHandler := errors.New("handler failure")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var secondRan int32
+
+	mustSubscribe(t, bus, "errors.collect.context", func(ctx context.Context, event TestEvent) error {
+		cancel()
+		return errHandler
+	}, HandlerPriority(PriorityHigh))
+	mustSubscribe(t, bus, "errors.collect.context", func(ctx context.Context, event TestEvent) error {
+		atomic.AddInt32(&secondRan, 1)
+		return nil
+	}, HandlerPriority(PriorityLow))
+
+	errs := bus.PublishCollectWithContext(ctx, "errors.collect.context", TestEvent{ID: "cancel", Value: 1})
+	if len(errs) != 2 || !errors.Is(errs[0], errHandler) || !errors.Is(errs[1], context.Canceled) {
+		t.Fatalf("Expected handler error followed by context cancellation, got %v", errs)
+	}
+	if atomic.LoadInt32(&secondRan) != 0 {
+		t.Fatal("Expected context cancellation to stop dispatch before the second handler")
+	}
+}
+
+func TestPublishCollectMiddlewareErrorTakesPrecedence(t *testing.T) {
+	bus := NewTyped[TestEvent]()
+	defer bus.Close()
+	bus.SetLogger(NewNoOpLogger())
+
+	errHandler := errors.New("handler failure")
+	errMiddleware := errors.New("middleware failure")
+	bus.AddMiddleware(func(topic string, event any, next func()) error {
+		next()
+		return errMiddleware
+	})
+	mustSubscribe(t, bus, "errors.collect.middleware", func(ctx context.Context, event TestEvent) error {
+		return errHandler
+	})
+
+	errs := bus.PublishCollect("errors.collect.middleware", TestEvent{ID: "middleware", Value: 1})
+	if len(errs) != 1 || !errors.Is(errs[0], errMiddleware) {
+		t.Fatalf("Expected middleware error to preserve Publish semantics, got %v", errs)
+	}
+}
+
 func TestMetrics(t *testing.T) {
 	bus := NewTyped[TestEvent]()
 	defer bus.Close()

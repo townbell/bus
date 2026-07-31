@@ -134,6 +134,29 @@ func ExampleEventBus_Publish() {
 	// err: disk full
 }
 
+// PublishCollect exposes each synchronous dispatch failure separately when a
+// caller needs to log, retry, or classify individual handler outcomes.
+func ExampleEventBus_PublishCollect() {
+	b := bus.NewTyped[string]()
+	defer b.Close()
+	b.SetLogger(bus.NewNoOpLogger())
+
+	b.Subscribe("job.run", func(ctx context.Context, id string) error {
+		return errors.New("disk full")
+	}, bus.HandlerPriority(bus.PriorityHigh))
+	b.Subscribe("job.run", func(ctx context.Context, id string) error {
+		return errors.New("index unavailable")
+	})
+
+	for _, err := range b.PublishCollect("job.run", "j-1") {
+		fmt.Println("failure:", err)
+	}
+
+	// Output:
+	// failure: disk full
+	// failure: index unavailable
+}
+
 // Middleware wraps the whole dispatch. Calling next runs the remaining
 // middleware and then the handlers; not calling it intercepts the event.
 func ExampleEventBus_AddMiddleware() {
