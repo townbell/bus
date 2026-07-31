@@ -343,9 +343,21 @@ handle, err := eventBus.Subscribe("payment.validate",
 `HandlerOnce`、`HandlerTimeout`、`HandlerRecoverPolicy`、`HandlerMaxConcurrency`、
 `HandlerSerial`。
 
+### 收集 Handler 错误
+
+当需要逐个处理同步 handler 的失败、而非只取得一个合并错误时，使用
+`PublishCollect`。异步 handler 的失败仍会交给配置的 `ErrorHandler`：
+
+```go
+for _, err := range eventBus.PublishCollect("payment.validate", payment) {
+    log.Printf("验证 handler 失败: %v", err)
+}
+```
+
 ## ✅ 行为约定
 
 - `Publish` 和 `PublishWithContext` 返回同步 handler 的失败合并（`errors.Is` 可以穿透）。这个错误可以安全忽略。异步 handler 的失败只通过 `ErrorHandler` 上报，因为发布调用可能在它们运行前就已返回。
+- `PublishCollect`、`PublishCollectWithContext` 和 `PublishCollectWithTimeout` 按 handler 执行顺序返回本次同步派发中的每个失败，包含 context、关闭和 middleware 错误；异步 handler 失败仍仅通过 `ErrorHandler` 上报。
 - handler 返回错误不会中断派发：后续 handler 照常执行。只有发布 context 被取消、总线关闭、或 handler 在 `RecoverAndStop` 策略下 panic 时才会提前终止派发。
 - 同步 handler 在调用发布的 goroutine 中执行，收到从发布调用派生的 context；异步 handler 在独立 goroutine 中执行，收到订阅 context（`HandlerContext`），`HandlerAsync(true)` 时同一 handler 串行执行。
 - `HandlerTimeout` 限制发布调用的等待时间，并在超时到达时取消 handler 的 context；无视 context 的 handler 会继续在后台运行，仍会被 `WaitAsync` 和 `Close` 等待。
@@ -374,7 +386,7 @@ Townbell 会优先保持“进程内、类型安全、轻量事件总线”的�
 | P0 | 试运行（v0.6.0） | 订阅 API 收敛 | 一个 `Subscribe(topic, fn, opts...) (*Handle[T], error)` 取代了此前的十个变体。将在 v1.0.0 冻结 |
 | P0 | 试运行（v0.6.0） | handler 错误上报 | handler 变为 `func(ctx, T) error`：业务失败无需 panic 即可进入指标、`ErrorHandler` 和发布返回值。解锁返回值收集。将在 v1.0.0 冻结 |
 | P0 | 试运行（v0.6.0） | `Publish` 错误语义 | `Publish` 返回同步 handler 失败的合并；忽略它依然合法。将在 v1.0.0 冻结 |
-| P2 | 未完成 | 返回值收集 | 参考 Blinker，提供 `PublishCollect` 一类 API，收集多个 handler 的返回值或错误 |
+| P2 | 部分完成（v0.9.0） | 返回值收集 | `PublishCollect` 按派发顺序返回每个同步 handler 错误；任意 handler 返回值收集需在 v1 单独设计 |
 | P2 | 已完成 | Topic 增强 | 通配符（`*`）topic、层级 `prefix.*` 模式、以及无订阅者时的 dead-event hook |
 | P2 | 部分完成 | 集成示例 | `net/http` 示例已提供；Gin、CLI、worker 待补充 |
 | P3 | 未完成 | Broker 桥接 | 参考 Watermill，探索 NATS / Kafka / RabbitMQ 适配器；优先放在独立子包，避免拖重核心库 |
@@ -406,6 +418,13 @@ type BusPublisher[T any] interface {
     Publish(topic string, event T) error
     PublishWithContext(ctx context.Context, topic string, event T) error
     PublishWithTimeout(topic string, event T, timeout time.Duration) error
+}
+
+// 可选的详细发布接口
+type BusResultCollector[T any] interface {
+    PublishCollect(topic string, event T) []error
+    PublishCollectWithContext(ctx context.Context, topic string, event T) []error
+    PublishCollectWithTimeout(topic string, event T, timeout time.Duration) []error
 }
 
 // 控制器接口

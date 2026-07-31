@@ -18,6 +18,15 @@ type BusPublisher[T any] interface {
 	PublishWithTimeout(topic string, event T, timeout time.Duration) error
 }
 
+// BusResultCollector defines the optional detailed publishing behavior. It is
+// kept separate from BusPublisher so existing publisher implementations stay
+// source-compatible.
+type BusResultCollector[T any] interface {
+	PublishCollect(topic string, event T) []error
+	PublishCollectWithContext(ctx context.Context, topic string, event T) []error
+	PublishCollectWithTimeout(topic string, event T, timeout time.Duration) []error
+}
+
 // BusController defines bus control behavior
 type BusController interface {
 	HasCallback(topic string) bool

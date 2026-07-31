@@ -349,9 +349,22 @@ Available options: `HandlerPriority`, `HandlerFilter`, `HandlerContext`,
 `HandlerAsync`, `HandlerOnce`, `HandlerTimeout`, `HandlerRecoverPolicy`,
 `HandlerMaxConcurrency`, `HandlerSerial`.
 
+### Collecting Handler Errors
+
+Use `PublishCollect` when each synchronous handler failure needs individual
+handling rather than a single joined error. Async failures still go to the
+configured `ErrorHandler`:
+
+```go
+for _, err := range eventBus.PublishCollect("payment.validate", payment) {
+    log.Printf("validation handler failed: %v", err)
+}
+```
+
 ## ✅ Behavior Contract
 
 - `Publish` and `PublishWithContext` return the joined failures of the synchronous handlers (`errors.Is` sees through the join). The error is safe to ignore. Asynchronous handler failures are reported through `ErrorHandler` only, because the publish call may return before they run.
+- `PublishCollect`, `PublishCollectWithContext`, and `PublishCollectWithTimeout` return each synchronous dispatch failure in handler execution order. They include context, close, and middleware failures; asynchronous handler failures remain available through `ErrorHandler` only.
 - A handler error does not stop dispatch: the remaining handlers still run. Dispatch stops early only when the publish context is canceled, the bus closes, or a handler panics under `RecoverAndStop`.
 - Synchronous handlers run in the goroutine that calls publish and receive a context derived from the publish call; asynchronous handlers run in separate goroutines and receive the subscription context (`HandlerContext`), and `HandlerAsync(true)` serializes calls to the same handler.
 - `HandlerTimeout` bounds how long the publish call waits and cancels the handler's context when it elapses; a handler that ignores its context keeps running in the background and is still awaited by `WaitAsync` and `Close`.
@@ -380,7 +393,7 @@ Townbell will keep its focus on being an in-process, type-safe, lightweight even
 | P0 | Preview (v0.6.0) | Subscription API convergence | One `Subscribe(topic, fn, opts...) (*Handle[T], error)` replaced the ten previous variants. Freezes at v1.0.0 |
 | P0 | Preview (v0.6.0) | Handler error reporting | Handlers are `func(ctx, T) error`: business failures reach metrics, the `ErrorHandler`, and the publish return value without panicking. Unblocks result collection. Freezes at v1.0.0 |
 | P0 | Preview (v0.6.0) | `Publish` error semantics | `Publish` returns the joined synchronous-handler failures; ignoring it stays legal. Freezes at v1.0.0 |
-| P2 | Planned | Result collection | Borrow from Blinker and add a `PublishCollect`-style API for collecting handler results or errors |
+| P2 | Partial (v0.9.0) | Result collection | `PublishCollect` returns each synchronous handler error in dispatch order; collecting arbitrary handler values needs a separate v1 design |
 | P2 | Done | Topic enhancements | Wildcard (`*`) topics, hierarchical `prefix.*` patterns, and a dead-event hook for publishes that reach no subscriber |
 | P2 | Partial | Integration examples | `net/http` example shipped; Gin, CLI apps, and workers remain |
 | P3 | Planned | Broker bridges | Borrow from Watermill and explore NATS / Kafka / RabbitMQ adapters, preferably in separate subpackages |
@@ -412,6 +425,13 @@ type BusPublisher[T any] interface {
     Publish(topic string, event T) error
     PublishWithContext(ctx context.Context, topic string, event T) error
     PublishWithTimeout(topic string, event T, timeout time.Duration) error
+}
+
+// Optional detailed publisher interface
+type BusResultCollector[T any] interface {
+    PublishCollect(topic string, event T) []error
+    PublishCollectWithContext(ctx context.Context, topic string, event T) []error
+    PublishCollectWithTimeout(topic string, event T, timeout time.Duration) []error
 }
 
 // Controller interface
