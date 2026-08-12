@@ -52,14 +52,14 @@ flowchart LR
 ## Install
 
 ```bash
-go get github.com/townbell/bus
+go get github.com/townbell/bus@v0.11.2
 ```
 
 The core module only imports the Go standard library. Prometheus support is
 optional and lives in its own module:
 
 ```bash
-go get github.com/townbell/bus/prometheus
+go get github.com/townbell/bus/prometheus@v0.11.2
 ```
 
 ## Quick start
