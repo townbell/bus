@@ -62,22 +62,23 @@ func (h *Handle[T]) IsActive() bool {
 
 // eventHandler represents an internal event handler
 type eventHandler[T any] struct {
-	id                    string
-	topic                 string
-	callBack              Handler[T]
-	flagOnce              bool
-	async                 bool
-	transactional         bool
-	priority              Priority
-	filter                EventFilter[T]
-	ctx                   context.Context
-	timeout               time.Duration
-	recoverPolicy         RecoverPolicy
-	maxConcurrency        int
-	concurrency           chan struct{}
-	active                atomic.Bool
-	metricsMu             sync.Mutex
-	metricsInFlight       int
-	metricsCleanupPending bool
-	sync.Mutex            // lock for an event handler - useful for running async callbacks serially
+	id             string
+	topic          string
+	callBack       Handler[T]
+	flagOnce       bool
+	async          bool
+	transactional  bool
+	priority       Priority
+	filter         EventFilter[T]
+	ctx            context.Context
+	timeout        time.Duration
+	recoverPolicy  RecoverPolicy
+	maxConcurrency int
+	concurrency    chan struct{}
+	active         atomic.Bool
+	// metricsState stores the number of running handler invocations and a
+	// cleanup bit. It avoids serializing every publish merely to coordinate
+	// metric-series removal during unsubscribe.
+	metricsState atomic.Int64
+	sync.Mutex   // lock for an event handler - useful for running async callbacks serially
 }

@@ -639,16 +639,19 @@ func (bus *EventBus[T]) removeHandler(topic string, target *eventHandler[T]) boo
 	return false
 }
 
+// handlerMetricsCleanupBit marks a removed subscription. The remaining bits
+// in eventHandler.metricsState count handler invocations that have started.
+const handlerMetricsCleanupBit int64 = 1 << 62
+
+// beginHandlerMetrics reserves a metrics slot before a handler begins. A
+// copy-on-write publish snapshot may legitimately begin after Unsubscribe
+// (notably HandlerOnce removes itself before invocation), so it must still be
+// counted and perform the deferred cleanup when it finishes.
 func (bus *EventBus[T]) beginHandlerMetrics(handler *eventHandler[T]) {
-	handler.metricsMu.Lock()
-	defer handler.metricsMu.Unlock()
-	handler.metricsInFlight++
+	handler.metricsState.Add(1)
 }
 
 func (bus *EventBus[T]) recordHandlerMetrics(metrics Metrics, handler *eventHandler[T], topic string, duration time.Duration, failed bool) {
-	handler.metricsMu.Lock()
-	defer handler.metricsMu.Unlock()
-
 	if detailed, ok := metrics.(DetailedMetrics); ok {
 		if failed {
 			detailed.RecordFailed(topic, handler.id, duration)
@@ -656,8 +659,11 @@ func (bus *EventBus[T]) recordHandlerMetrics(metrics Metrics, handler *eventHand
 			detailed.RecordProcessed(topic, handler.id, duration)
 		}
 	}
-	handler.metricsInFlight--
-	if handler.metricsCleanupPending && handler.metricsInFlight == 0 {
+
+	// A remover sets the cleanup bit atomically with observing the in-flight
+	// count. Therefore the invocation which drops the count to zero owns the
+	// deferred metric cleanup without a handler-wide mutex.
+	if handler.metricsState.Add(-1) == handlerMetricsCleanupBit {
 		if cleaner, ok := metrics.(HandlerMetricsCleaner); ok {
 			cleaner.RemoveHandlerMetrics(handler.topic, handler.id)
 		}
@@ -665,13 +671,20 @@ func (bus *EventBus[T]) recordHandlerMetrics(metrics Metrics, handler *eventHand
 }
 
 func (bus *EventBus[T]) removeHandlerMetrics(handler *eventHandler[T]) {
-	handler.metricsMu.Lock()
-	defer handler.metricsMu.Unlock()
-	handler.metricsCleanupPending = true
-	if handler.metricsInFlight == 0 {
-		if cleaner, ok := bus.metrics.(HandlerMetricsCleaner); ok {
-			cleaner.RemoveHandlerMetrics(handler.topic, handler.id)
+	for {
+		state := handler.metricsState.Load()
+		if state&handlerMetricsCleanupBit != 0 {
+			return
 		}
+		if !handler.metricsState.CompareAndSwap(state, state|handlerMetricsCleanupBit) {
+			continue
+		}
+		if state == 0 {
+			if cleaner, ok := bus.metrics.(HandlerMetricsCleaner); ok {
+				cleaner.RemoveHandlerMetrics(handler.topic, handler.id)
+			}
+		}
+		return
 	}
 }
 
