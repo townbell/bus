@@ -57,6 +57,30 @@ func BenchmarkAsyncPublish(b *testing.B) {
 	bus.WaitAsync()
 }
 
+func BenchmarkAsyncPublishBounded(b *testing.B) {
+	bus := NewTyped[BenchEvent]()
+	defer bus.Close()
+
+	mustSubscribe(b, bus, "bench.async.bounded", benchHandler,
+		HandlerAsync(false),
+		HandlerMaxConcurrency(4),
+		HandlerQueueCapacity(4096),
+	)
+
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			bus.Publish("bench.async.bounded", BenchEvent{
+				ID:   i,
+				Data: "test data",
+			})
+			i++
+		}
+	})
+	bus.WaitAsync()
+}
+
 func BenchmarkMultipleSubscribers(b *testing.B) {
 	bus := NewTyped[BenchEvent]()
 	defer bus.Close()

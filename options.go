@@ -24,6 +24,7 @@ type handlerOptions struct {
 	timeout        time.Duration
 	recoverPolicy  RecoverPolicy
 	maxConcurrency int
+	queueCapacity  int
 	// filter holds an EventFilter[T]. The option constructor is generic while
 	// HandlerOption is not, so the value is carried as any and re-typed by
 	// Subscribe, which reports a mismatch as an error.
@@ -90,10 +91,23 @@ func HandlerRecoverPolicy(policy RecoverPolicy) HandlerOption {
 	}
 }
 
-// HandlerMaxConcurrency limits concurrent executions of this handler. Values below 1 mean unlimited.
+// HandlerMaxConcurrency limits concurrent executions of this handler. For an
+// asynchronous handler it also uses a bounded work queue, preventing an
+// overload from creating an unbounded number of goroutines. Values below 1
+// mean unlimited.
 func HandlerMaxConcurrency(limit int) HandlerOption {
 	return func(opts *handlerOptions) {
 		opts.maxConcurrency = limit
+	}
+}
+
+// HandlerQueueCapacity sets the maximum number of running and queued jobs for
+// an asynchronous bounded-concurrency handler. When full, the event is
+// rejected and reported to ErrorHandler. Values below 1 use the default of 64
+// jobs per worker.
+func HandlerQueueCapacity(capacity int) HandlerOption {
+	return func(opts *handlerOptions) {
+		opts.queueCapacity = capacity
 	}
 }
 

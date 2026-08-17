@@ -11,4 +11,9 @@ var (
 	ErrNilHandle = errors.New("handle is nil: the subscription was never created")
 	// ErrSubscriptionInactive reports an operation attempted on an inactive subscription.
 	ErrSubscriptionInactive = errors.New("subscription is inactive")
+	// ErrAsyncQueueFull reports a rejected asynchronous delivery when its
+	// bounded handler queue is full. It is delivered to ErrorHandler rather
+	// than returned by Publish because asynchronous delivery has already
+	// detached from the publisher.
+	ErrAsyncQueueFull = errors.New("asynchronous handler queue is full")
 )

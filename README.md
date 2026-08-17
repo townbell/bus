@@ -121,7 +121,7 @@ cd example && go run worker_example.go
 | --- | --- |
 | `Publish` | Runs synchronous handlers in priority order and returns their joined errors. Later handlers still run after an ordinary error. |
 | `PublishCollect` | Returns every synchronous failure in dispatch order when callers need to retry, classify, or log separately. |
-| Async handlers | Return before the handler finishes; failures are reported only through `ErrorHandler`. Use async to free the caller, not to make CPU work faster. |
+| Async handlers | Return before the handler finishes; failures are reported only through `ErrorHandler`. `HandlerMaxConcurrency` uses a bounded queue (64 jobs per worker by default); overflow is reported as `ErrAsyncQueueFull`. Use `HandlerQueueCapacity` to tune that bound. |
 | Patterns | `*` matches every topic. `orders.*` matches `orders.created` and deeper descendants, but not `orders`. |
 | Context and timeout | Cancellation stops later synchronous dispatch and is passed to the current handler. Handlers must honor their context to stop promptly. |
 | Shutdown | `Close` rejects new publish/subscribe calls and waits for already-started async work. Call `WaitAsync` when a process must drain earlier. |
@@ -139,7 +139,7 @@ b.Subscribe("payment.validate", validate,
 
 Available options: `HandlerPriority`, `HandlerFilter`, `HandlerContext`,
 `HandlerAsync`, `HandlerOnce`, `HandlerTimeout`, `HandlerRecoverPolicy`,
-`HandlerMaxConcurrency`, and `HandlerSerial`.
+`HandlerMaxConcurrency`, `HandlerQueueCapacity`, and `HandlerSerial`.
 
 ## Features at a glance
 

@@ -159,6 +159,20 @@ func (bus *EventBus[T]) Subscribe(topic string, fn Handler[T], options ...Handle
 		maxConcurrency: opts.maxConcurrency,
 		Mutex:          sync.Mutex{},
 	}
+	if handler.async && (handler.maxConcurrency > 0 || handler.transactional) {
+		limit := handler.maxConcurrency
+		if handler.transactional {
+			limit = 1
+		}
+		capacity := opts.queueCapacity
+		if capacity < 1 {
+			capacity = limit * 64
+		}
+		if capacity < limit {
+			capacity = limit
+		}
+		handler.asyncQueue = &asyncQueue{limit: limit, capacity: capacity}
+	}
 	handler.active.Store(true)
 
 	bus.lock.Lock()
@@ -426,12 +440,27 @@ func (bus *EventBus[T]) dispatchCollect(ctx context.Context, topic string, event
 		if !bus.addAsync() {
 			return append(errs, ErrBusClosed)
 		}
+		if handler.asyncQueue != nil {
+			if bus.scheduleBoundedAsync(handler, topic, event, closeCh, logger, debugLog, errorHandler, metrics) {
+				continue
+			}
+			bus.wg.Done()
+			bus.reportAsyncQueueFull(handler, topic, event, errorHandler, metrics)
+			continue
+		}
 		if handler.transactional {
 			handler.Lock()
 		}
-		go bus.doPublishAsync(handler, topic, event, closeCh, logger, debugLog, errorHandler, metrics)
+		go bus.doPublishAsyncDirect(handler, topic, event, closeCh, logger, debugLog, errorHandler, metrics)
 	}
 	return errs
+}
+
+func (bus *EventBus[T]) scheduleBoundedAsync(handler *eventHandler[T], topic string, event T, closeCh <-chan struct{}, logger Logger, debugLog bool, errorHandler ErrorHandler, metrics Metrics) bool {
+	return handler.asyncQueue.submit(func() {
+		defer bus.wg.Done()
+		bus.doPublishAsync(handler, topic, event, closeCh, logger, debugLog, errorHandler, metrics)
+	})
 }
 
 func (bus *EventBus[T]) addAsync() bool {
@@ -583,14 +612,29 @@ func acquireConcurrency[T any](ctx context.Context, closeCh <-chan struct{}, han
 	}
 }
 
-func (bus *EventBus[T]) doPublishAsync(handler *eventHandler[T], topic string, event T, closeCh <-chan struct{}, logger Logger, debugLog bool, errorHandler ErrorHandler, metrics Metrics) {
+func (bus *EventBus[T]) doPublishAsyncDirect(handler *eventHandler[T], topic string, event T, closeCh <-chan struct{}, logger Logger, debugLog bool, errorHandler ErrorHandler, metrics Metrics) {
 	defer bus.wg.Done()
 	defer func() {
 		if handler.transactional {
 			handler.Unlock()
 		}
 	}()
+	bus.doPublishAsync(handler, topic, event, closeCh, logger, debugLog, errorHandler, metrics)
+}
 
+func (bus *EventBus[T]) reportAsyncQueueFull(handler *eventHandler[T], topic string, event T, errorHandler ErrorHandler, metrics Metrics) {
+	if errorHandler != nil {
+		errorHandler(&EventError{
+			Topic:   topic,
+			Event:   event,
+			Handler: handler.callBack,
+			Err:     ErrAsyncQueueFull,
+		})
+	}
+	metrics.IncrementFailed()
+}
+
+func (bus *EventBus[T]) doPublishAsync(handler *eventHandler[T], topic string, event T, closeCh <-chan struct{}, logger Logger, debugLog bool, errorHandler ErrorHandler, metrics Metrics) {
 	// The publish call may already have returned, so asynchronous handlers run
 	// under the subscription context rather than the publish context.
 	ctx := handler.ctx
