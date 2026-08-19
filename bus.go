@@ -402,20 +402,17 @@ func (bus *EventBus[T]) dispatchCollect(ctx context.Context, topic string, event
 	var errs []error
 
 	for _, handler := range handlers {
+		if err := ctx.Err(); err != nil {
+			return append(errs, err)
+		}
 		select {
-		case <-ctx.Done():
-			return append(errs, ctx.Err())
 		case <-closeCh:
 			return append(errs, ErrBusClosed)
 		default:
 		}
 
-		if handler.ctx != nil {
-			select {
-			case <-handler.ctx.Done():
-				continue
-			default:
-			}
+		if handler.ctx != nil && handler.ctx.Err() != nil {
+			continue
 		}
 
 		if handler.filter != nil && !handler.filter(topic, event) {
@@ -508,17 +505,26 @@ func (bus *EventBus[T]) doPublish(ctx context.Context, closeCh <-chan struct{}, 
 		ctx = context.Background()
 	}
 
-	bus.beginHandlerMetrics(handler)
-	start := time.Now()
+	detailed, collectDetailed := metrics.(DetailedMetrics)
+	var start time.Time
+	if collectDetailed {
+		bus.beginHandlerMetrics(handler)
+		start = time.Now()
+	}
 	err := bus.runHandler(ctx, closeCh, handler, event)
-	duration := time.Since(start)
+	var duration time.Duration
+	if collectDetailed {
+		duration = time.Since(start)
+	}
 
 	if err == nil {
 		if debugLog {
 			logger.Debug("Handler executed successfully for topic '%s'", topic)
 		}
 		metrics.IncrementProcessed()
-		bus.recordHandlerMetrics(metrics, handler, topic, duration, false)
+		if collectDetailed {
+			bus.recordHandlerMetrics(detailed, handler, topic, duration, false)
+		}
 		return nil, false
 	}
 
@@ -540,7 +546,9 @@ func (bus *EventBus[T]) doPublish(ctx context.Context, closeCh <-chan struct{}, 
 		})
 	}
 	metrics.IncrementFailed()
-	bus.recordHandlerMetrics(metrics, handler, topic, duration, true)
+	if collectDetailed {
+		bus.recordHandlerMetrics(detailed, handler, topic, duration, true)
+	}
 	return err, isPanic && handler.recoverPolicy == RecoverAndStop
 }
 
@@ -695,13 +703,11 @@ func (bus *EventBus[T]) beginHandlerMetrics(handler *eventHandler[T]) {
 	handler.metricsState.Add(1)
 }
 
-func (bus *EventBus[T]) recordHandlerMetrics(metrics Metrics, handler *eventHandler[T], topic string, duration time.Duration, failed bool) {
-	if detailed, ok := metrics.(DetailedMetrics); ok {
-		if failed {
-			detailed.RecordFailed(topic, handler.id, duration)
-		} else {
-			detailed.RecordProcessed(topic, handler.id, duration)
-		}
+func (bus *EventBus[T]) recordHandlerMetrics(metrics DetailedMetrics, handler *eventHandler[T], topic string, duration time.Duration, failed bool) {
+	if failed {
+		metrics.RecordFailed(topic, handler.id, duration)
+	} else {
+		metrics.RecordProcessed(topic, handler.id, duration)
 	}
 
 	// A remover sets the cleanup bit atomically with observing the in-flight
