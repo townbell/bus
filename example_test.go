@@ -163,7 +163,7 @@ func ExampleEventBus_AddMiddleware() {
 	b := bus.NewTyped[string]()
 	defer b.Close()
 
-	b.AddMiddleware(func(topic string, event any, next func()) error {
+	b.AddMiddleware(func(topic string, event string, next func()) error {
 		fmt.Println("before", topic)
 		next()
 		fmt.Println("after", topic)

@@ -15,12 +15,11 @@
 no serialization layer. It gives a Go application type-safe fan-out, bounded
 asynchronous work, priority, filters, middleware, and observable failures.
 
-[中文文档](README_ZH.md) · [API reference](https://pkg.go.dev/github.com/townbell/bus) · [Examples](example/README.md) · [Migration from v0.5.x](MIGRATION.md)
+[中文文档](README_ZH.md) · [API reference](https://pkg.go.dev/github.com/townbell/bus) · [Examples](example/README.md) · [Migration guide](MIGRATION.md)
 
-> **API preview.** Since v0.6.0, subscriptions use one
-> `Subscribe(topic, handler, options...)` method, handlers return `error`, and
-> `Publish` returns synchronous delivery failures. This API is intended to
-> freeze at v1.0.0; feedback is welcome before then.
+> **API preview.** The v0.13 development line makes the last breaking
+> corrections before v1: typed middleware, smaller extension interfaces, and
+> explicit error and lifecycle contracts. See the [migration guide](MIGRATION.md).
 
 ## Why Townbell?
 
@@ -119,12 +118,13 @@ cd example && go run worker_example.go
 
 | Concern | Contract |
 | --- | --- |
-| `Publish` | Runs synchronous handlers in priority order and returns their joined errors. Later handlers still run after an ordinary error. |
-| `PublishCollect` | Returns every synchronous failure in dispatch order when callers need to retry, classify, or log separately. |
-| Async handlers | Return before the handler finishes; failures are reported only through `ErrorHandler`. `HandlerMaxConcurrency` uses a bounded queue (64 jobs per worker by default); overflow is reported as `ErrAsyncQueueFull`. Use `HandlerQueueCapacity` to tune that bound. |
+| `Publish` | Runs synchronous handlers in priority order and returns joined handler and middleware errors. Later handlers still run after an ordinary error. |
+| `PublishCollect` | Returns synchronous handler failures in dispatch order, followed by middleware failures as the chain unwinds. |
+| Async handlers | Return before the handler finishes; failures are reported only through `ErrorHandler`. `HandlerMaxConcurrency` uses a bounded queue (64 jobs per worker by default); overflow is reported as `ErrAsyncQueueFull`. `HandlerQueueCapacity` is valid only with bounded asynchronous delivery. |
 | Patterns | `*` matches every topic. `orders.*` matches `orders.created` and deeper descendants, but not `orders`. |
-| Context and timeout | Cancellation stops later synchronous dispatch and is passed to the current handler. Handlers must honor their context to stop promptly. |
-| Shutdown | `Close` rejects new publish/subscribe calls and waits for already-started async work. Call `WaitAsync` when a process must drain earlier. |
+| Context and timeout | Cancellation stops later synchronous dispatch and is passed to the current handler. Handler timeouts wrap `context.DeadlineExceeded`; handlers must honor their context to stop promptly. |
+| Hooks | Handlers, filters, middleware, error hooks, loggers, and metrics may be called concurrently and must be concurrency-safe. |
+| Shutdown | `WaitAsync` drains accepted async work only after publishers are quiescent. `Close` is the concurrent shutdown barrier; call it from the bus owner, not from one of its async handlers. |
 
 Useful options compose in one subscription:
 
@@ -159,12 +159,14 @@ Available options: `HandlerPriority`, `HandlerFilter`, `HandlerContext`,
 | ✅ | v0.8 publish hot path | Copy-on-write handler snapshots and zero-allocation synchronous publishing |
 | ✅ | v0.9 result collection | `PublishCollect` exposes individual synchronous delivery failures |
 | ✅ | v0.11 P2 integration examples | Runnable Gin service and standard-library CLI lifecycle guide |
-| Planned | v1.0 API freeze | Audit preview contracts, settle any compatibility feedback, then freeze the core API and migration guidance |
+| ✅ | v0.12 bounded async work | Bounded handler queues and measured publish-path optimizations |
+| Release candidate | v0.13 API freeze | Typed middleware, narrow interfaces, explicit registration errors, lifecycle contracts, and migration guidance |
+| Planned | v1.0 API freeze | Validate the v0.13 candidate in real consumers, then freeze the public API |
 | Planned | P3 broker bridge | Design one transport-specific adapter as a separate module; define delivery, retry, and shutdown semantics before code |
 | Planned | P4 mediator mode | Validate a concrete application use case and publish it as an optional package, not a `Bus` concern |
 | Planned | P5 stateful capability | Keep state, persistence, and recovery outside the core; require a separate design proposal and ownership model |
 
-The ordered path after v0.11 is API-freeze readiness, then v1.0. P3–P5 are
+The ordered path is v0.13 consumer validation, then v1.0. P3–P5 are
 intentionally optional modules: each needs a dedicated proposal, explicit
 dependency and delivery guarantees, and its own release cadence before work
 starts. None should add a runtime dependency to the core module.

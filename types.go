@@ -41,19 +41,28 @@ func (e *EventError) Error() string {
 	return fmt.Sprintf("event error in topic '%s': %v", e.Topic, e.Err)
 }
 
+// Unwrap exposes the underlying handler, middleware, or delivery error.
+func (e *EventError) Unwrap() error {
+	return e.Err
+}
+
 // DeadEventHandler observes events published to a topic with no subscribed
 // handlers, in the spirit of Guava's DeadEvent. It runs synchronously in the
-// publishing goroutine, so it should return quickly.
+// publishing goroutine, may be called concurrently by multiple publishers,
+// and should return quickly.
 type DeadEventHandler[T any] func(topic string, event T)
 
-// EventFilter allows filtering events before they reach handlers
+// EventFilter allows filtering events before they reach handlers. A filter may
+// be called concurrently by multiple publishers.
 type EventFilter[T any] func(topic string, event T) bool
 
 // EventMiddleware allows intercepting events before and after processing.
 //
 // A middleware that wants dispatch to continue must call next before it
-// returns. Calling next after the middleware returns is ignored.
+// returns. Calling next after the middleware returns is ignored. Middleware
+// may be called concurrently by multiple publishers.
 type EventMiddleware[T any] func(topic string, event T, next func()) error
 
-// ErrorHandler defines how to handle errors during event processing
+// ErrorHandler handles errors during event processing. It may be called
+// concurrently and may run inline with Publish, so it should return quickly.
 type ErrorHandler func(err *EventError)

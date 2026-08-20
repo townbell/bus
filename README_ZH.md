@@ -13,11 +13,11 @@
 
 `bus` 专注于进程内事件派发：没有消息代理、运行时依赖或序列化层。它为 Go 应用提供类型安全的扇出、受控异步执行、优先级、过滤器、中间件，以及可观测的失败处理。
 
-[English](README.md) · [API 参考](https://pkg.go.dev/github.com/townbell/bus) · [示例](example/README_ZH.md) · [从 v0.5.x 迁移](MIGRATION_ZH.md)
+[English](README.md) · [API 参考](https://pkg.go.dev/github.com/townbell/bus) · [示例](example/README_ZH.md) · [迁移指南](MIGRATION_ZH.md)
 
-> **API 试运行中。** 自 v0.6.0 起，订阅统一为
-> `Subscribe(topic, handler, options...)`；handler 返回 `error`，`Publish`
-> 返回同步派发失败。这套 API 计划在 v1.0.0 冻结，冻结前欢迎反馈。
+> **API 试运行中。** v0.13 开发线完成 V1 前最后一轮破坏性修正：类型安全的
+> middleware、更小的扩展接口，以及明确的错误与生命周期契约。详见
+> [迁移指南](MIGRATION_ZH.md)。
 
 ## 为什么选择 Townbell？
 
@@ -113,12 +113,13 @@ cd example && go run worker_example.go
 
 | 关注点 | 约定 |
 | --- | --- |
-| `Publish` | 按优先级运行同步 handler，返回这些 handler 的合并错误。普通错误不会阻止后续 handler。 |
-| `PublishCollect` | 需要分别重试、分类或记录时，按派发顺序返回每一项同步失败。 |
-| 异步 handler | 发布调用会先返回；失败只通过 `ErrorHandler` 上报。异步的目的是释放调用方，而不是让 CPU 工作变快。 |
+| `Publish` | 按优先级运行同步 handler，并返回 handler 与 middleware 的合并错误。普通错误不会阻止后续 handler。 |
+| `PublishCollect` | 先按派发顺序返回同步 handler 失败，再按 middleware 链回退顺序返回 middleware 失败。 |
+| 异步 handler | 发布调用会先返回；失败只通过 `ErrorHandler` 上报。`HandlerMaxConcurrency` 使用有界队列，溢出上报 `ErrAsyncQueueFull`；`HandlerQueueCapacity` 只对有界异步派发有效。 |
 | 模式 | `*` 匹配全部 topic；`orders.*` 匹配 `orders.created` 及更深层级，但不匹配 `orders` 本身。 |
-| Context 与超时 | 取消会停止后续同步派发，并传递给当前 handler。handler 必须配合检查 context 才能及时停止。 |
-| 关闭 | `Close` 拒绝新的发布和订阅，并等待已启动的异步工作；需要提前排空时调用 `WaitAsync`。 |
+| Context 与超时 | 取消会停止后续同步派发，并传递给当前 handler。handler 超时会包装 `context.DeadlineExceeded`；handler 必须配合检查 context 才能及时停止。 |
+| 用户钩子 | handler、filter、middleware、错误钩子、logger 和 metrics 都可能并发调用，必须保证并发安全。 |
+| 关闭 | 仅在发布方已停止后用 `WaitAsync` 排空已接受的异步工作。并发关闭使用 `Close`；由总线 owner 调用，不能在本总线的异步 handler 内调用。 |
 
 一个订阅中的常用选项可以自由组合：
 
@@ -131,7 +132,7 @@ b.Subscribe("payment.validate", validate,
 )
 ```
 
-可用选项：`HandlerPriority`、`HandlerFilter`、`HandlerContext`、`HandlerAsync`、`HandlerOnce`、`HandlerTimeout`、`HandlerRecoverPolicy`、`HandlerMaxConcurrency`、`HandlerSerial`。
+可用选项：`HandlerPriority`、`HandlerFilter`、`HandlerContext`、`HandlerAsync`、`HandlerOnce`、`HandlerTimeout`、`HandlerRecoverPolicy`、`HandlerMaxConcurrency`、`HandlerQueueCapacity`、`HandlerSerial`。
 
 ## 能力一览
 
@@ -151,12 +152,14 @@ b.Subscribe("payment.validate", validate,
 | ✅ | v0.8 发布热路径 | handler 快照 copy-on-write，同步发布零分配 |
 | ✅ | v0.9 错误收集 | `PublishCollect` 暴露每一项同步派发失败 |
 | ✅ | v0.11 P2 集成示例 | 可运行的 Gin 服务与基于标准库的 CLI 生命周期指南 |
-| 计划中 | v1.0 API 冻结 | 审核预览期契约，处理兼容性反馈后冻结核心 API 和迁移指引 |
+| ✅ | v0.12 有界异步执行 | 有界 handler 队列与经过基准验证的发布路径优化 |
+| 候选待发布 | v0.13 API 冻结 | 类型安全 middleware、窄接口、显式注册错误、生命周期契约与迁移指引 |
+| 计划中 | v1.0 API 冻结 | 在真实调用方验证 v0.13 候选版本后冻结公开 API |
 | 计划中 | P3 broker 桥接 | 先为一个传输协议设计独立适配模块；编码前明确投递、重试和关闭语义 |
 | 计划中 | P4 Mediator 模式 | 以明确的应用场景验证后发布为可选包，不纳入 `Bus` 职责 |
 | 计划中 | P5 状态型能力 | 状态、持久化和恢复不进入核心；需另行设计提案与责任模型 |
 
-v0.11 之后的顺序是先完成 API 冻结准备，再发布 v1.0。P3–P5 均为刻意保持在
+后续顺序是先验证 v0.13 调用方兼容性，再发布 v1.0。P3–P5 均为刻意保持在
 核心模块之外的可选模块：每项启动前都需要独立提案、明确的依赖和投递保证，以及
 自己的发布节奏；不得向核心模块引入运行时依赖。
 

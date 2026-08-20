@@ -70,10 +70,10 @@ type handlerMetrics struct {
 // Read them through GetStats, GetTopicStats, and GetHandlerStats rather than
 // accessing the counter fields directly.
 type DefaultMetrics struct {
-	PublishedEvents   int64
-	ProcessedEvents   int64
-	FailedEvents      int64
-	ActiveSubscribers int32
+	publishedEvents   int64
+	processedEvents   int64
+	failedEvents      int64
+	activeSubscribers int32
 	topicMetrics      sync.Map // map[string]*topicMetrics
 	handlerMetrics    sync.Map // map[string]*handlerMetrics
 }
@@ -82,30 +82,30 @@ var _ DetailedMetrics = (*DefaultMetrics)(nil)
 var _ HandlerMetricsCleaner = (*DefaultMetrics)(nil)
 
 func (m *DefaultMetrics) IncrementPublished() {
-	atomic.AddInt64(&m.PublishedEvents, 1)
+	atomic.AddInt64(&m.publishedEvents, 1)
 }
 
 func (m *DefaultMetrics) IncrementProcessed() {
-	atomic.AddInt64(&m.ProcessedEvents, 1)
+	atomic.AddInt64(&m.processedEvents, 1)
 }
 
 func (m *DefaultMetrics) IncrementFailed() {
-	atomic.AddInt64(&m.FailedEvents, 1)
+	atomic.AddInt64(&m.failedEvents, 1)
 }
 
 func (m *DefaultMetrics) IncrementSubscribers() {
-	atomic.AddInt32(&m.ActiveSubscribers, 1)
+	atomic.AddInt32(&m.activeSubscribers, 1)
 }
 
 func (m *DefaultMetrics) DecrementSubscribers() {
-	atomic.AddInt32(&m.ActiveSubscribers, -1)
+	atomic.AddInt32(&m.activeSubscribers, -1)
 }
 
 func (m *DefaultMetrics) GetStats() (published, processed, failed int64, activeSubscribers int32) {
-	return atomic.LoadInt64(&m.PublishedEvents),
-		atomic.LoadInt64(&m.ProcessedEvents),
-		atomic.LoadInt64(&m.FailedEvents),
-		atomic.LoadInt32(&m.ActiveSubscribers)
+	return atomic.LoadInt64(&m.publishedEvents),
+		atomic.LoadInt64(&m.processedEvents),
+		atomic.LoadInt64(&m.failedEvents),
+		atomic.LoadInt32(&m.activeSubscribers)
 }
 
 // RecordPublished records a published event for a topic.

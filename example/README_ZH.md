@@ -47,13 +47,13 @@ curl -i -X POST http://localhost:8080/orders \
 go run cli_example.go -name Ada -repeat 2
 ```
 
-影响命令退出状态的工作应使用同步 handler。`main` 返回前调用 `WaitAsync`；随后
-调用 `Close` 拒绝新任务并等待期间已启动的 handler。
+影响命令退出状态的工作应使用同步 handler。发布方停止后，在 `main` 返回前调用
+`WaitAsync`；需要与发布方并发地安全关闭时使用 `Close`。
 
 ## 重要边界
 
 - 这些都是**进程内**示例。`HandlerMaxConcurrency` 限制的是当前进程的工作量；它不是持久化队列，也不是多进程 worker 系统。
 - 当派发失败会影响业务结果时，请检查 `Subscribe` 和同步 `Publish` 返回的 `error`。异步失败会进入 `ErrorHandler`。
-- 进程有序退出前使用 `WaitAsync` 排空已启动的异步工作；再调用 `Close` 拒绝新工作并等待已有 handler。
+- 只在发布方已停止后使用 `WaitAsync`；并发关闭由 owner 调用 `Close`，拒绝新工作并等待已接受的 handler。
 
 完整 API 语义和最小可复制代码请看[项目 README](../README_ZH.md)。

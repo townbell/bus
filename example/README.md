@@ -50,9 +50,9 @@ finishes active requests before the example drains and closes the bus.
 go run cli_example.go -name Ada -repeat 2
 ```
 
-Use synchronous handlers for work that decides the command's exit status. Call
-`WaitAsync` before returning from `main`, then call `Close` to reject new work
-and wait for any handler that began concurrently.
+Use synchronous handlers for work that decides the command's exit status. Once
+publishers have stopped, call `WaitAsync` before returning from `main`; use
+`Close` when shutdown must race safely with publishers.
 
 ## Important boundaries
 
@@ -60,8 +60,8 @@ and wait for any handler that began concurrently.
   current process; it is not a durable queue or a multi-process worker system.
 - Check the `error` returned by `Subscribe` and synchronous `Publish` when
   delivery failures matter. Async failures arrive at `ErrorHandler`.
-- Use `WaitAsync` before an orderly process exit, then `Close` to reject new
-  work and wait for already-started handlers.
+- Use `WaitAsync` only after publishers are quiescent. Use owner-driven `Close`
+  to reject new work and wait for accepted handlers during concurrent shutdown.
 
 For API semantics and the smallest copyable snippet, see the
 [main README](../README.md).

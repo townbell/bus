@@ -103,8 +103,10 @@ func HandlerMaxConcurrency(limit int) HandlerOption {
 
 // HandlerQueueCapacity sets the maximum number of running and queued jobs for
 // an asynchronous bounded-concurrency handler. When full, the event is
-// rejected and reported to ErrorHandler. Values below 1 use the default of 64
-// jobs per worker.
+// rejected and reported to ErrorHandler. A positive value requires HandlerAsync
+// with HandlerMaxConcurrency or transactional delivery; otherwise Subscribe
+// returns ErrInvalidHandlerOptions. Values below 1 use the default of 64 jobs
+// per worker.
 func HandlerQueueCapacity(capacity int) HandlerOption {
 	return func(opts *handlerOptions) {
 		opts.queueCapacity = capacity

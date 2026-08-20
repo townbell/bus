@@ -24,7 +24,7 @@ func main() {
 	defer eventBus.Close()
 
 	// Middleware 1: Request ID injection
-	eventBus.AddMiddleware(func(topic string, event interface{}, next func()) error {
+	eventBus.AddMiddleware(func(topic string, event Event, next func()) error {
 		log.Printf("[REQUEST] Processing event for topic: %s", topic)
 		next()
 		log.Printf("[REQUEST] Completed processing for topic: %s", topic)
@@ -32,7 +32,7 @@ func main() {
 	})
 
 	// Middleware 2: Timing
-	eventBus.AddMiddleware(func(topic string, event interface{}, next func()) error {
+	eventBus.AddMiddleware(func(topic string, event Event, next func()) error {
 		start := time.Now()
 		log.Printf("[TIMER] Start processing topic: %s", topic)
 
@@ -44,7 +44,7 @@ func main() {
 	})
 
 	// Middleware 3: Rate limiting simulation
-	eventBus.AddMiddleware(func(topic string, event interface{}, next func()) error {
+	eventBus.AddMiddleware(func(topic string, event Event, next func()) error {
 		// Simulate rate limit check
 		if topic == "rate.limited" {
 			log.Printf("[RATE_LIMIT] Rate limit applied to topic: %s", topic)

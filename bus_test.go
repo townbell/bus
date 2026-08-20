@@ -16,6 +16,12 @@ type TestEvent struct {
 	Value int
 }
 
+var (
+	_ BusSubscriber[TestEvent]      = (*EventBus[TestEvent])(nil)
+	_ BusPublisher[TestEvent]       = (*EventBus[TestEvent])(nil)
+	_ BusResultCollector[TestEvent] = (*EventBus[TestEvent])(nil)
+)
+
 // discard is a handler that succeeds without doing anything.
 func discard[T any](context.Context, T) error { return nil }
 
@@ -415,24 +421,36 @@ func TestPublishCollectReportsContextCancellationAfterPriorErrors(t *testing.T) 
 	}
 }
 
-func TestPublishCollectMiddlewareErrorTakesPrecedence(t *testing.T) {
+func TestPublishCollectPreservesHandlerAndMiddlewareErrors(t *testing.T) {
 	bus := NewTyped[TestEvent]()
 	defer bus.Close()
 	bus.SetLogger(NewNoOpLogger())
 
 	errHandler := errors.New("handler failure")
-	errMiddleware := errors.New("middleware failure")
-	bus.AddMiddleware(func(topic string, event any, next func()) error {
+	errOuterMiddleware := errors.New("outer middleware failure")
+	errInnerMiddleware := errors.New("inner middleware failure")
+	var reported []error
+	bus.SetErrorHandler(func(eventErr *EventError) {
+		reported = append(reported, eventErr.Err)
+	})
+	bus.AddMiddleware(func(topic string, event TestEvent, next func()) error {
 		next()
-		return errMiddleware
+		return errOuterMiddleware
+	})
+	bus.AddMiddleware(func(topic string, event TestEvent, next func()) error {
+		next()
+		return errInnerMiddleware
 	})
 	mustSubscribe(t, bus, "errors.collect.middleware", func(ctx context.Context, event TestEvent) error {
 		return errHandler
 	})
 
 	errs := bus.PublishCollect("errors.collect.middleware", TestEvent{ID: "middleware", Value: 1})
-	if len(errs) != 1 || !errors.Is(errs[0], errMiddleware) {
-		t.Fatalf("Expected middleware error to preserve Publish semantics, got %v", errs)
+	if len(errs) != 3 || !errors.Is(errs[0], errHandler) || !errors.Is(errs[1], errInnerMiddleware) || !errors.Is(errs[2], errOuterMiddleware) {
+		t.Fatalf("Expected handler error followed by inner and outer middleware errors, got %v", errs)
+	}
+	if len(reported) != 3 || !errors.Is(reported[0], errHandler) || !errors.Is(reported[1], errInnerMiddleware) || !errors.Is(reported[2], errOuterMiddleware) {
+		t.Fatalf("Expected ErrorHandler to receive every failure, got %v", reported)
 	}
 }
 
@@ -490,7 +508,7 @@ func TestMiddleware(t *testing.T) {
 	var handlerCalled int32
 
 	// Add middleware
-	bus.AddMiddleware(func(topic string, event interface{}, next func()) error {
+	bus.AddMiddleware(func(topic string, event TestEvent, next func()) error {
 		atomic.AddInt32(&middlewareCalled, 1)
 		next()
 		return nil
@@ -521,7 +539,7 @@ func TestMiddlewareCanSkipHandlers(t *testing.T) {
 
 	var handlerCalled int32
 
-	bus.AddMiddleware(func(topic string, event interface{}, next func()) error {
+	bus.AddMiddleware(func(topic string, event TestEvent, next func()) error {
 		return nil
 	})
 	mustSubscribe(t, bus, "middleware.skip.test", func(ctx context.Context, event TestEvent) error {
@@ -541,7 +559,7 @@ func TestMiddlewareNextIsIdempotent(t *testing.T) {
 	defer bus.Close()
 
 	var handlerCalled int32
-	bus.AddMiddleware(func(topic string, event interface{}, next func()) error {
+	bus.AddMiddleware(func(topic string, event TestEvent, next func()) error {
 		next()
 		next()
 		return nil
@@ -563,7 +581,7 @@ func TestMiddlewareNextIsConcurrentSafe(t *testing.T) {
 	defer bus.Close()
 
 	var handlerCalled int32
-	bus.AddMiddleware(func(topic string, event interface{}, next func()) error {
+	bus.AddMiddleware(func(topic string, event TestEvent, next func()) error {
 		var wg sync.WaitGroup
 		for i := 0; i < 10; i++ {
 			wg.Add(1)
@@ -593,7 +611,7 @@ func TestMiddlewareNextAfterReturnIsIgnored(t *testing.T) {
 
 	nexts := make(chan func(), 1)
 	var handlerCalled int32
-	bus.AddMiddleware(func(topic string, event interface{}, next func()) error {
+	bus.AddMiddleware(func(topic string, event TestEvent, next func()) error {
 		nexts <- next
 		return nil
 	})
@@ -674,8 +692,8 @@ func TestHandlerTimeoutOption(t *testing.T) {
 	start := time.Now()
 	err := bus.PublishWithContext(context.Background(), "handler.timeout", TestEvent{ID: "timeout", Value: 1})
 	elapsed := time.Since(start)
-	if err == nil {
-		t.Fatal("Expected handler timeout error")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Expected context deadline exceeded, got %v", err)
 	}
 	if elapsed > 80*time.Millisecond {
 		t.Fatalf("Expected handler timeout around 20ms, took %v", elapsed)
@@ -1084,7 +1102,7 @@ func TestPublishDoesNotStartAsyncHandlerAfterClose(t *testing.T) {
 	release := make(chan struct{})
 	var processed int32
 
-	bus.AddMiddleware(func(topic string, event any, next func()) error {
+	bus.AddMiddleware(func(topic string, event TestEvent, next func()) error {
 		close(ready)
 		<-release
 		next()
@@ -1518,10 +1536,11 @@ func TestGetSubscriberCount(t *testing.T) {
 
 // TestEventError tests the EventError type
 func TestEventError(t *testing.T) {
+	underlying := errors.New("test error")
 	err := &EventError{
 		Topic: "test.topic",
 		Event: TestEvent{ID: "test", Value: 42},
-		Err:   fmt.Errorf("test error"),
+		Err:   underlying,
 	}
 
 	errorString := err.Error()
@@ -1530,6 +1549,9 @@ func TestEventError(t *testing.T) {
 	}
 	if !strings.Contains(errorString, "test error") {
 		t.Errorf("Expected error string to contain 'test error', got '%s'", errorString)
+	}
+	if !errors.Is(err, underlying) {
+		t.Fatal("Expected EventError to unwrap its underlying error")
 	}
 }
 
@@ -1611,6 +1633,15 @@ func TestNilInputsAreIgnoredOrRejected(t *testing.T) {
 	}
 	if handle, err := bus.Subscribe("nil.ctx", discard[TestEvent], HandlerContext(nil)); err != nil || handle == nil {
 		t.Fatalf("Expected nil context to default to background context, got handle=%v err=%v", handle, err)
+	}
+	if _, err := bus.Subscribe("invalid.queue", discard[TestEvent], HandlerQueueCapacity(1)); !errors.Is(err, ErrInvalidHandlerOptions) {
+		t.Fatalf("Expected invalid queue options error, got %v", err)
+	}
+	if _, err := bus.Subscribe("invalid.async.queue", discard[TestEvent], HandlerAsync(false), HandlerQueueCapacity(1)); !errors.Is(err, ErrInvalidHandlerOptions) {
+		t.Fatalf("Expected unbounded async queue options error, got %v", err)
+	}
+	if _, err := bus.Subscribe("valid.queue", discard[TestEvent], HandlerAsync(false), HandlerMaxConcurrency(1), HandlerQueueCapacity(1)); err != nil {
+		t.Fatalf("Expected bounded asynchronous queue options to be accepted, got %v", err)
 	}
 
 	bus.Publish("nil.ctx", TestEvent{ID: "ok", Value: 1})
