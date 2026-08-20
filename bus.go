@@ -159,6 +159,20 @@ func (bus *EventBus[T]) Subscribe(topic string, fn Handler[T], options ...Handle
 		maxConcurrency: opts.maxConcurrency,
 		Mutex:          sync.Mutex{},
 	}
+	if handler.async && (handler.maxConcurrency > 0 || handler.transactional) {
+		limit := handler.maxConcurrency
+		if handler.transactional {
+			limit = 1
+		}
+		capacity := opts.queueCapacity
+		if capacity < 1 {
+			capacity = limit * 64
+		}
+		if capacity < limit {
+			capacity = limit
+		}
+		handler.asyncQueue = &asyncQueue{limit: limit, capacity: capacity}
+	}
 	handler.active.Store(true)
 
 	bus.lock.Lock()
@@ -388,20 +402,17 @@ func (bus *EventBus[T]) dispatchCollect(ctx context.Context, topic string, event
 	var errs []error
 
 	for _, handler := range handlers {
+		if err := ctx.Err(); err != nil {
+			return append(errs, err)
+		}
 		select {
-		case <-ctx.Done():
-			return append(errs, ctx.Err())
 		case <-closeCh:
 			return append(errs, ErrBusClosed)
 		default:
 		}
 
-		if handler.ctx != nil {
-			select {
-			case <-handler.ctx.Done():
-				continue
-			default:
-			}
+		if handler.ctx != nil && handler.ctx.Err() != nil {
+			continue
 		}
 
 		if handler.filter != nil && !handler.filter(topic, event) {
@@ -426,12 +437,27 @@ func (bus *EventBus[T]) dispatchCollect(ctx context.Context, topic string, event
 		if !bus.addAsync() {
 			return append(errs, ErrBusClosed)
 		}
+		if handler.asyncQueue != nil {
+			if bus.scheduleBoundedAsync(handler, topic, event, closeCh, logger, debugLog, errorHandler, metrics) {
+				continue
+			}
+			bus.wg.Done()
+			bus.reportAsyncQueueFull(handler, topic, event, errorHandler, metrics)
+			continue
+		}
 		if handler.transactional {
 			handler.Lock()
 		}
-		go bus.doPublishAsync(handler, topic, event, closeCh, logger, debugLog, errorHandler, metrics)
+		go bus.doPublishAsyncDirect(handler, topic, event, closeCh, logger, debugLog, errorHandler, metrics)
 	}
 	return errs
+}
+
+func (bus *EventBus[T]) scheduleBoundedAsync(handler *eventHandler[T], topic string, event T, closeCh <-chan struct{}, logger Logger, debugLog bool, errorHandler ErrorHandler, metrics Metrics) bool {
+	return handler.asyncQueue.submit(func() {
+		defer bus.wg.Done()
+		bus.doPublishAsync(handler, topic, event, closeCh, logger, debugLog, errorHandler, metrics)
+	})
 }
 
 func (bus *EventBus[T]) addAsync() bool {
@@ -479,17 +505,26 @@ func (bus *EventBus[T]) doPublish(ctx context.Context, closeCh <-chan struct{}, 
 		ctx = context.Background()
 	}
 
-	bus.beginHandlerMetrics(handler)
-	start := time.Now()
+	detailed, collectDetailed := metrics.(DetailedMetrics)
+	var start time.Time
+	if collectDetailed {
+		bus.beginHandlerMetrics(handler)
+		start = time.Now()
+	}
 	err := bus.runHandler(ctx, closeCh, handler, event)
-	duration := time.Since(start)
+	var duration time.Duration
+	if collectDetailed {
+		duration = time.Since(start)
+	}
 
 	if err == nil {
 		if debugLog {
 			logger.Debug("Handler executed successfully for topic '%s'", topic)
 		}
 		metrics.IncrementProcessed()
-		bus.recordHandlerMetrics(metrics, handler, topic, duration, false)
+		if collectDetailed {
+			bus.recordHandlerMetrics(detailed, handler, topic, duration, false)
+		}
 		return nil, false
 	}
 
@@ -511,7 +546,9 @@ func (bus *EventBus[T]) doPublish(ctx context.Context, closeCh <-chan struct{}, 
 		})
 	}
 	metrics.IncrementFailed()
-	bus.recordHandlerMetrics(metrics, handler, topic, duration, true)
+	if collectDetailed {
+		bus.recordHandlerMetrics(detailed, handler, topic, duration, true)
+	}
 	return err, isPanic && handler.recoverPolicy == RecoverAndStop
 }
 
@@ -583,14 +620,29 @@ func acquireConcurrency[T any](ctx context.Context, closeCh <-chan struct{}, han
 	}
 }
 
-func (bus *EventBus[T]) doPublishAsync(handler *eventHandler[T], topic string, event T, closeCh <-chan struct{}, logger Logger, debugLog bool, errorHandler ErrorHandler, metrics Metrics) {
+func (bus *EventBus[T]) doPublishAsyncDirect(handler *eventHandler[T], topic string, event T, closeCh <-chan struct{}, logger Logger, debugLog bool, errorHandler ErrorHandler, metrics Metrics) {
 	defer bus.wg.Done()
 	defer func() {
 		if handler.transactional {
 			handler.Unlock()
 		}
 	}()
+	bus.doPublishAsync(handler, topic, event, closeCh, logger, debugLog, errorHandler, metrics)
+}
 
+func (bus *EventBus[T]) reportAsyncQueueFull(handler *eventHandler[T], topic string, event T, errorHandler ErrorHandler, metrics Metrics) {
+	if errorHandler != nil {
+		errorHandler(&EventError{
+			Topic:   topic,
+			Event:   event,
+			Handler: handler.callBack,
+			Err:     ErrAsyncQueueFull,
+		})
+	}
+	metrics.IncrementFailed()
+}
+
+func (bus *EventBus[T]) doPublishAsync(handler *eventHandler[T], topic string, event T, closeCh <-chan struct{}, logger Logger, debugLog bool, errorHandler ErrorHandler, metrics Metrics) {
 	// The publish call may already have returned, so asynchronous handlers run
 	// under the subscription context rather than the publish context.
 	ctx := handler.ctx
@@ -639,25 +691,29 @@ func (bus *EventBus[T]) removeHandler(topic string, target *eventHandler[T]) boo
 	return false
 }
 
+// handlerMetricsCleanupBit marks a removed subscription. The remaining bits
+// in eventHandler.metricsState count handler invocations that have started.
+const handlerMetricsCleanupBit int64 = 1 << 62
+
+// beginHandlerMetrics reserves a metrics slot before a handler begins. A
+// copy-on-write publish snapshot may legitimately begin after Unsubscribe
+// (notably HandlerOnce removes itself before invocation), so it must still be
+// counted and perform the deferred cleanup when it finishes.
 func (bus *EventBus[T]) beginHandlerMetrics(handler *eventHandler[T]) {
-	handler.metricsMu.Lock()
-	defer handler.metricsMu.Unlock()
-	handler.metricsInFlight++
+	handler.metricsState.Add(1)
 }
 
-func (bus *EventBus[T]) recordHandlerMetrics(metrics Metrics, handler *eventHandler[T], topic string, duration time.Duration, failed bool) {
-	handler.metricsMu.Lock()
-	defer handler.metricsMu.Unlock()
-
-	if detailed, ok := metrics.(DetailedMetrics); ok {
-		if failed {
-			detailed.RecordFailed(topic, handler.id, duration)
-		} else {
-			detailed.RecordProcessed(topic, handler.id, duration)
-		}
+func (bus *EventBus[T]) recordHandlerMetrics(metrics DetailedMetrics, handler *eventHandler[T], topic string, duration time.Duration, failed bool) {
+	if failed {
+		metrics.RecordFailed(topic, handler.id, duration)
+	} else {
+		metrics.RecordProcessed(topic, handler.id, duration)
 	}
-	handler.metricsInFlight--
-	if handler.metricsCleanupPending && handler.metricsInFlight == 0 {
+
+	// A remover sets the cleanup bit atomically with observing the in-flight
+	// count. Therefore the invocation which drops the count to zero owns the
+	// deferred metric cleanup without a handler-wide mutex.
+	if handler.metricsState.Add(-1) == handlerMetricsCleanupBit {
 		if cleaner, ok := metrics.(HandlerMetricsCleaner); ok {
 			cleaner.RemoveHandlerMetrics(handler.topic, handler.id)
 		}
@@ -665,13 +721,20 @@ func (bus *EventBus[T]) recordHandlerMetrics(metrics Metrics, handler *eventHand
 }
 
 func (bus *EventBus[T]) removeHandlerMetrics(handler *eventHandler[T]) {
-	handler.metricsMu.Lock()
-	defer handler.metricsMu.Unlock()
-	handler.metricsCleanupPending = true
-	if handler.metricsInFlight == 0 {
-		if cleaner, ok := bus.metrics.(HandlerMetricsCleaner); ok {
-			cleaner.RemoveHandlerMetrics(handler.topic, handler.id)
+	for {
+		state := handler.metricsState.Load()
+		if state&handlerMetricsCleanupBit != 0 {
+			return
 		}
+		if !handler.metricsState.CompareAndSwap(state, state|handlerMetricsCleanupBit) {
+			continue
+		}
+		if state == 0 {
+			if cleaner, ok := bus.metrics.(HandlerMetricsCleaner); ok {
+				cleaner.RemoveHandlerMetrics(handler.topic, handler.id)
+			}
+		}
+		return
 	}
 }
 

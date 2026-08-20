@@ -36,6 +36,22 @@ func BenchmarkSyncPublish(b *testing.B) {
 	})
 }
 
+func BenchmarkSyncPublishBasicMetrics(b *testing.B) {
+	bus := NewTyped[BenchEvent](WithMetrics[BenchEvent](&CustomMetrics{}))
+	defer bus.Close()
+
+	mustSubscribe(b, bus, "bench.sync.basic_metrics", benchHandler)
+
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			_ = bus.Publish("bench.sync.basic_metrics", BenchEvent{ID: i, Data: "test data"})
+			i++
+		}
+	})
+}
+
 func BenchmarkAsyncPublish(b *testing.B) {
 	bus := NewTyped[BenchEvent]()
 	defer bus.Close()
@@ -55,6 +71,64 @@ func BenchmarkAsyncPublish(b *testing.B) {
 	})
 
 	bus.WaitAsync()
+}
+
+func BenchmarkAsyncPublishBounded(b *testing.B) {
+	b.Run("accepted_and_drained", func(b *testing.B) {
+		const capacity = 4096
+		bus := NewTyped[BenchEvent]()
+		defer bus.Close()
+
+		mustSubscribe(b, bus, "bench.async.bounded", benchHandler,
+			HandlerAsync(false),
+			HandlerMaxConcurrency(4),
+			HandlerQueueCapacity(capacity),
+		)
+
+		b.ResetTimer()
+		for published := 0; published < b.N; {
+			batch := min(capacity, b.N-published)
+			for i := 0; i < batch; i++ {
+				_ = bus.Publish("bench.async.bounded", BenchEvent{ID: published + i, Data: "test data"})
+			}
+			bus.WaitAsync()
+			published += batch
+		}
+		b.StopTimer()
+
+		_, processed, failed, _ := bus.GetMetrics().GetStats()
+		if processed != int64(b.N) || failed != 0 {
+			b.Fatalf("processed=%d failed=%d, want processed=%d failed=0", processed, failed, b.N)
+		}
+	})
+
+	b.Run("rejected", func(b *testing.B) {
+		bus := NewTyped[BenchEvent]()
+		defer bus.Close()
+		started := make(chan struct{})
+		release := make(chan struct{})
+
+		mustSubscribe(b, bus, "bench.async.rejected", func(context.Context, BenchEvent) error {
+			close(started)
+			<-release
+			return nil
+		}, HandlerAsync(false), HandlerMaxConcurrency(1), HandlerQueueCapacity(1))
+		_ = bus.Publish("bench.async.rejected", BenchEvent{})
+		<-started
+
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			_ = bus.Publish("bench.async.rejected", BenchEvent{ID: i})
+		}
+		b.StopTimer()
+		close(release)
+		bus.WaitAsync()
+
+		_, _, failed, _ := bus.GetMetrics().GetStats()
+		if failed != int64(b.N) {
+			b.Fatalf("failed=%d, want %d", failed, b.N)
+		}
+	})
 }
 
 func BenchmarkMultipleSubscribers(b *testing.B) {

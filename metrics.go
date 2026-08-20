@@ -49,32 +49,33 @@ type HandlerMetricsSnapshot struct {
 }
 
 type topicMetrics struct {
-	publishedEvents int64
-	processedEvents int64
-	failedEvents    int64
-	totalDuration   time.Duration
+	publishedEvents atomic.Int64
+	processedEvents atomic.Int64
+	failedEvents    atomic.Int64
+	totalDuration   atomic.Int64
 }
 
 type handlerMetrics struct {
 	topic           string
-	processedEvents int64
-	failedEvents    int64
-	totalDuration   time.Duration
+	processedEvents atomic.Int64
+	failedEvents    atomic.Int64
+	totalDuration   atomic.Int64
 }
 
 // DefaultMetrics is the default implementation of the Metrics interface.
 //
-// The counter fields are updated atomically and sit on the publish hot path;
-// read them through GetStats rather than directly. The mutex guards only the
-// per-topic and per-handler maps.
+// Aggregate counters and detailed metrics are independently atomically updated.
+// The detailed metric maps use sync.Map because they grow only when a topic or
+// subscription is first observed, but are read and written on every publish.
+// Read them through GetStats, GetTopicStats, and GetHandlerStats rather than
+// accessing the counter fields directly.
 type DefaultMetrics struct {
 	PublishedEvents   int64
 	ProcessedEvents   int64
 	FailedEvents      int64
 	ActiveSubscribers int32
-	topicMetrics      map[string]*topicMetrics
-	handlerMetrics    map[string]*handlerMetrics
-	mu                sync.RWMutex
+	topicMetrics      sync.Map // map[string]*topicMetrics
+	handlerMetrics    sync.Map // map[string]*handlerMetrics
 }
 
 var _ DetailedMetrics = (*DefaultMetrics)(nil)
@@ -109,104 +110,90 @@ func (m *DefaultMetrics) GetStats() (published, processed, failed int64, activeS
 
 // RecordPublished records a published event for a topic.
 func (m *DefaultMetrics) RecordPublished(topic string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.ensureMaps()
-	m.getTopicMetricsLocked(topic).publishedEvents++
+	m.getTopicMetrics(topic).publishedEvents.Add(1)
 }
 
 // RecordProcessed records a successful handler execution.
 func (m *DefaultMetrics) RecordProcessed(topic, handlerID string, duration time.Duration) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.ensureMaps()
-	topicStats := m.getTopicMetricsLocked(topic)
-	topicStats.processedEvents++
-	topicStats.totalDuration += duration
+	topicStats := m.getTopicMetrics(topic)
+	topicStats.processedEvents.Add(1)
+	topicStats.totalDuration.Add(int64(duration))
 
-	handlerStats := m.getHandlerMetricsLocked(topic, handlerID)
-	handlerStats.processedEvents++
-	handlerStats.totalDuration += duration
+	handlerStats := m.getHandlerMetrics(topic, handlerID)
+	handlerStats.processedEvents.Add(1)
+	handlerStats.totalDuration.Add(int64(duration))
 }
 
 // RecordFailed records a failed handler execution.
 func (m *DefaultMetrics) RecordFailed(topic, handlerID string, duration time.Duration) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.ensureMaps()
-	topicStats := m.getTopicMetricsLocked(topic)
-	topicStats.failedEvents++
-	topicStats.totalDuration += duration
+	topicStats := m.getTopicMetrics(topic)
+	topicStats.failedEvents.Add(1)
+	topicStats.totalDuration.Add(int64(duration))
 
-	handlerStats := m.getHandlerMetricsLocked(topic, handlerID)
-	handlerStats.failedEvents++
-	handlerStats.totalDuration += duration
+	handlerStats := m.getHandlerMetrics(topic, handlerID)
+	handlerStats.failedEvents.Add(1)
+	handlerStats.totalDuration.Add(int64(duration))
 }
 
 // GetTopicStats returns a snapshot of per-topic metrics.
 func (m *DefaultMetrics) GetTopicStats() map[string]TopicMetricsSnapshot {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	result := make(map[string]TopicMetricsSnapshot, len(m.topicMetrics))
-	for topic, stats := range m.topicMetrics {
+	result := make(map[string]TopicMetricsSnapshot)
+	m.topicMetrics.Range(func(key, value any) bool {
+		topic := key.(string)
+		stats := value.(*topicMetrics)
 		result[topic] = TopicMetricsSnapshot{
-			PublishedEvents: stats.publishedEvents,
-			ProcessedEvents: stats.processedEvents,
-			FailedEvents:    stats.failedEvents,
-			TotalDuration:   stats.totalDuration,
+			PublishedEvents: stats.publishedEvents.Load(),
+			ProcessedEvents: stats.processedEvents.Load(),
+			FailedEvents:    stats.failedEvents.Load(),
+			TotalDuration:   time.Duration(stats.totalDuration.Load()),
 		}
-	}
+		return true
+	})
 	return result
 }
 
 // GetHandlerStats returns a snapshot of per-handler metrics.
 func (m *DefaultMetrics) GetHandlerStats() map[string]HandlerMetricsSnapshot {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	result := make(map[string]HandlerMetricsSnapshot, len(m.handlerMetrics))
-	for handlerID, stats := range m.handlerMetrics {
+	result := make(map[string]HandlerMetricsSnapshot)
+	m.handlerMetrics.Range(func(key, value any) bool {
+		handlerID := key.(string)
+		stats := value.(*handlerMetrics)
 		result[handlerID] = HandlerMetricsSnapshot{
 			Topic:           stats.topic,
-			ProcessedEvents: stats.processedEvents,
-			FailedEvents:    stats.failedEvents,
-			TotalDuration:   stats.totalDuration,
+			ProcessedEvents: stats.processedEvents.Load(),
+			FailedEvents:    stats.failedEvents.Load(),
+			TotalDuration:   time.Duration(stats.totalDuration.Load()),
 		}
-	}
+		return true
+	})
 	return result
 }
 
 // RemoveHandlerMetrics discards per-handler metrics for an inactive subscription.
 func (m *DefaultMetrics) RemoveHandlerMetrics(_ string, handlerID string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	delete(m.handlerMetrics, handlerID)
+	m.handlerMetrics.Delete(handlerID)
 }
 
-func (m *DefaultMetrics) ensureMaps() {
-	if m.topicMetrics == nil {
-		m.topicMetrics = make(map[string]*topicMetrics)
+func (m *DefaultMetrics) getTopicMetrics(topic string) *topicMetrics {
+	if metrics, ok := m.topicMetrics.Load(topic); ok {
+		return metrics.(*topicMetrics)
 	}
-	if m.handlerMetrics == nil {
-		m.handlerMetrics = make(map[string]*handlerMetrics)
+	candidate := &topicMetrics{}
+	metrics, loaded := m.topicMetrics.LoadOrStore(topic, candidate)
+	if loaded {
+		return metrics.(*topicMetrics)
 	}
+	return candidate
 }
 
-func (m *DefaultMetrics) getTopicMetricsLocked(topic string) *topicMetrics {
-	stats := m.topicMetrics[topic]
-	if stats == nil {
-		stats = &topicMetrics{}
-		m.topicMetrics[topic] = stats
+func (m *DefaultMetrics) getHandlerMetrics(topic, handlerID string) *handlerMetrics {
+	if metrics, ok := m.handlerMetrics.Load(handlerID); ok {
+		return metrics.(*handlerMetrics)
 	}
-	return stats
-}
-
-func (m *DefaultMetrics) getHandlerMetricsLocked(topic, handlerID string) *handlerMetrics {
-	stats := m.handlerMetrics[handlerID]
-	if stats == nil {
-		stats = &handlerMetrics{topic: topic}
-		m.handlerMetrics[handlerID] = stats
+	candidate := &handlerMetrics{topic: topic}
+	metrics, loaded := m.handlerMetrics.LoadOrStore(handlerID, candidate)
+	if loaded {
+		return metrics.(*handlerMetrics)
 	}
-	return stats
+	return candidate
 }

@@ -47,13 +47,13 @@ flowchart LR
 ## 安装
 
 ```bash
-go get github.com/townbell/bus
+go get github.com/townbell/bus@v0.12.0
 ```
 
 核心模块只导入 Go 标准库。Prometheus 支持是可选的独立模块：
 
 ```bash
-go get github.com/townbell/bus/prometheus
+go get github.com/townbell/bus/prometheus@v0.12.0
 ```
 
 ## 快速开始

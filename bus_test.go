@@ -872,6 +872,58 @@ func TestHandlerMaxConcurrencyOption(t *testing.T) {
 	}
 }
 
+func TestAsyncBoundedQueueRejectsOverflowAndDrainsAcceptedEvents(t *testing.T) {
+	bus := NewTyped[TestEvent]()
+	defer bus.Close()
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var processed atomic.Int32
+	queueFull := make(chan *EventError, 1)
+	bus.SetErrorHandler(func(eventErr *EventError) {
+		if errors.Is(eventErr.Err, ErrAsyncQueueFull) {
+			queueFull <- eventErr
+		}
+	})
+	mustSubscribe(t, bus, "async.bounded", func(context.Context, TestEvent) error {
+		if processed.Add(1) == 1 {
+			close(started)
+			<-release
+		}
+		return nil
+	}, HandlerAsync(false), HandlerMaxConcurrency(1), HandlerQueueCapacity(2))
+
+	if err := bus.Publish("async.bounded", TestEvent{ID: "first"}); err != nil {
+		t.Fatalf("Publish first: %v", err)
+	}
+	<-started
+	if err := bus.Publish("async.bounded", TestEvent{ID: "second"}); err != nil {
+		t.Fatalf("Publish second: %v", err)
+	}
+	if err := bus.Publish("async.bounded", TestEvent{ID: "overflow"}); err != nil {
+		t.Fatalf("Publish overflow: %v", err)
+	}
+
+	select {
+	case eventErr := <-queueFull:
+		if eventErr.Topic != "async.bounded" || eventErr.Event.(TestEvent).ID != "overflow" {
+			t.Fatalf("Unexpected overflow error: %#v", eventErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Expected queue overflow to reach ErrorHandler")
+	}
+
+	close(release)
+	bus.WaitAsync()
+	if got := processed.Load(); got != 2 {
+		t.Fatalf("Expected two accepted events to drain, got %d", got)
+	}
+	_, _, failed, _ := bus.GetMetrics().GetStats()
+	if failed != 1 {
+		t.Fatalf("Expected one rejected async delivery, got %d failures", failed)
+	}
+}
+
 func TestHandleUnsubscribe(t *testing.T) {
 	bus := NewTyped[TestEvent]()
 	defer bus.Close()
