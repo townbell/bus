@@ -2,6 +2,7 @@ package bus
 
 import (
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"sync/atomic"
@@ -37,14 +38,8 @@ func (l LogLevel) String() string {
 type Logger interface {
 	// Debug logs a debug message
 	Debug(msg string, args ...interface{})
-	// Info logs an info message
-	Info(msg string, args ...interface{})
-	// Warn logs a warning message
-	Warn(msg string, args ...interface{})
 	// Error logs an error message
 	Error(msg string, args ...interface{})
-	// SetLevel sets the minimum log level
-	SetLevel(level LogLevel)
 	// GetLevel returns the current log level
 	GetLevel() LogLevel
 }
@@ -65,7 +60,7 @@ func NewDefaultLogger() *DefaultLogger {
 }
 
 // NewDefaultLoggerWithOutput creates a new default logger with custom output
-func NewDefaultLoggerWithOutput(output *os.File, prefix string) *DefaultLogger {
+func NewDefaultLoggerWithOutput(output io.Writer, prefix string) *DefaultLogger {
 	logger := &DefaultLogger{
 		logger: log.New(output, prefix, log.LstdFlags|log.Lshortfile),
 	}

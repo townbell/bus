@@ -61,7 +61,7 @@ func main() {
 	})
 
 	// Add middleware for audit logging
-	orderBus.AddMiddleware(func(topic string, event interface{}, next func()) error {
+	orderBus.AddMiddleware(func(topic string, event Order, next func()) error {
 		log.Printf("[AUDIT] Order event: %s", topic)
 		next()
 		return nil
@@ -80,7 +80,7 @@ func main() {
 	fmt.Println("\nWorkflow completed!")
 }
 
-func processOrderWorkflow(orderBus bus.Bus[Order], paymentBus bus.Bus[Payment], inventoryBus bus.Bus[Inventory]) {
+func processOrderWorkflow(orderBus *bus.EventBus[Order], paymentBus *bus.EventBus[Payment], inventoryBus *bus.EventBus[Inventory]) {
 	// Order Service - handles order lifecycle
 	orderCreatedHandle, _ := orderBus.Subscribe("order.created", func(ctx context.Context, order Order) error {
 		fmt.Printf("📦 [ORDER-SERVICE] Order created: %s for user %s (%.2f)\n",

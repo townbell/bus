@@ -14,13 +14,15 @@ import (
 
 // EventBus dispatches events to topic subscribers.
 //
-// EventBus is safe for concurrent use by multiple goroutines.
+// EventBus is safe for concurrent use by multiple goroutines. WaitAsync is the
+// exception: publishers must be quiescent before it is called. Use Close to
+// reject new work and wait for accepted asynchronous work during shutdown.
 type EventBus[T any] struct {
 	handlers map[string][]*eventHandler[T]
 	// patternTopics tracks the handler-map keys that are patterns ("*" or a
 	// trailing ".*"), so a publish only scans patterns instead of every topic.
 	patternTopics    map[string]struct{}
-	middlewares      []EventMiddleware[any]
+	middlewares      []EventMiddleware[T]
 	errorHandler     ErrorHandler
 	deadEventHandler DeadEventHandler[T]
 	metrics          Metrics
@@ -63,7 +65,7 @@ func WithErrorHandler[T any](handler ErrorHandler) Option[T] {
 }
 
 // WithMiddleware adds a middleware to the EventBus
-func WithMiddleware[T any](middleware EventMiddleware[any]) Option[T] {
+func WithMiddleware[T any](middleware EventMiddleware[T]) Option[T] {
 	return func(b *EventBus[T]) {
 		if middleware == nil {
 			return
@@ -85,7 +87,7 @@ func NewTyped[T any](opts ...Option[T]) *EventBus[T] {
 	b := &EventBus[T]{
 		handlers:      make(map[string][]*eventHandler[T]),
 		patternTopics: make(map[string]struct{}),
-		middlewares:   make([]EventMiddleware[any], 0),
+		middlewares:   make([]EventMiddleware[T], 0),
 		metrics:       &DefaultMetrics{},
 		logger:        NewDefaultLogger(),
 		lock:          sync.RWMutex{},
@@ -119,8 +121,8 @@ func New(opts ...Option[any]) *EventBus[any] {
 // "user.created.eu" but not "user" itself.
 //
 // Subscribe reports why a subscription was rejected: a nil handler, a filter
-// whose event type does not match the bus, or a closed bus. On error the
-// returned handle is nil; a nil handle is still safe to use.
+// whose event type does not match the bus, incompatible options, or a closed
+// bus. On error the returned handle is nil; a nil handle is still safe to use.
 func (bus *EventBus[T]) Subscribe(topic string, fn Handler[T], options ...HandlerOption) (*Handle[T], error) {
 	if fn == nil {
 		return nil, ErrNilHandler
@@ -134,6 +136,9 @@ func (bus *EventBus[T]) Subscribe(topic string, fn Handler[T], options ...Handle
 	}
 	if opts.ctx == nil {
 		opts.ctx = context.Background()
+	}
+	if opts.queueCapacity > 0 && (!opts.async || (opts.maxConcurrency <= 0 && !opts.transactional)) {
+		return nil, fmt.Errorf("%w: HandlerQueueCapacity requires bounded asynchronous delivery", ErrInvalidHandlerOptions)
 	}
 
 	var filter EventFilter[T]
@@ -254,9 +259,9 @@ func (bus *EventBus[T]) HasCallback(topic string) bool {
 }
 
 // Publish delivers event to the topic's handlers. The returned error joins
-// the failures of the synchronous handlers, and is safe to ignore when
-// delivery failures do not matter to the caller. Asynchronous handler
-// failures are reported through the ErrorHandler instead.
+// synchronous handler and middleware failures, and is safe to ignore when
+// delivery failures do not matter to the caller. Asynchronous handler failures
+// are reported through the ErrorHandler instead.
 func (bus *EventBus[T]) Publish(topic string, event T) error {
 	return errors.Join(bus.PublishCollect(topic, event)...)
 }
@@ -268,11 +273,11 @@ func (bus *EventBus[T]) PublishWithContext(ctx context.Context, topic string, ev
 	return errors.Join(bus.PublishCollectWithContext(ctx, topic, event)...)
 }
 
-// PublishCollect publishes an event and returns each synchronous dispatch
-// failure in handler execution order. It includes errors caused by context
-// cancellation, closing the bus, and middleware. Asynchronous handler
-// failures remain available through ErrorHandler only, because they may occur
-// after this method returns.
+// PublishCollect publishes an event and returns synchronous handler failures
+// in dispatch order, followed by middleware failures as the chain unwinds. It
+// also includes errors caused by context cancellation and closing the bus.
+// Asynchronous handler failures remain available through ErrorHandler only,
+// because they may occur after this method returns.
 //
 // A nil result means no synchronous dispatch failure occurred. The result is
 // independent of future publishes and may be inspected or retained by the
@@ -322,7 +327,7 @@ func (bus *EventBus[T]) PublishCollectWithContext(ctx context.Context, topic str
 		})
 		handlers = merged
 	}
-	middlewares := append([]EventMiddleware[any](nil), bus.middlewares...)
+	middlewares := append([]EventMiddleware[T](nil), bus.middlewares...)
 	bus.lock.RUnlock()
 
 	// A varargs call boxes its arguments before the logger can filter by
@@ -341,8 +346,8 @@ func (bus *EventBus[T]) PublishCollectWithContext(ctx context.Context, topic str
 		deadEventHandler(topic, event)
 	}
 
-	// Fast path: with no middleware there is no reason to box the event into
-	// any or allocate the chain closures.
+	// Fast path: with no middleware there is no reason to allocate the chain
+	// closures.
 	if len(middlewares) == 0 {
 		return bus.dispatchCollect(ctx, topic, event, handlers, closeCh, logger, debugLog, errorHandler, metrics)
 	}
@@ -350,8 +355,8 @@ func (bus *EventBus[T]) PublishCollectWithContext(ctx context.Context, topic str
 	dispatch := func() []error {
 		return bus.dispatchCollect(ctx, topic, event, handlers, closeCh, logger, debugLog, errorHandler, metrics)
 	}
-	dispatchErrs, middlewareErr := runMiddlewares(middlewares, topic, event, dispatch)
-	if middlewareErr != nil {
+	dispatchErrs, middlewareErrs := runMiddlewares(middlewares, topic, event, dispatch)
+	for _, middlewareErr := range middlewareErrs {
 		if errorHandler != nil {
 			errorHandler(&EventError{
 				Topic: topic,
@@ -359,17 +364,13 @@ func (bus *EventBus[T]) PublishCollectWithContext(ctx context.Context, topic str
 				Err:   middlewareErr,
 			})
 		}
-		return []error{middlewareErr}
 	}
-	return dispatchErrs
+	return append(dispatchErrs, middlewareErrs...)
 }
 
-func runMiddlewares(middlewares []EventMiddleware[any], topic string, event any, dispatch func() []error) (dispatchErrs []error, middlewareErr error) {
+func runMiddlewares[T any](middlewares []EventMiddleware[T], topic string, event T, dispatch func() []error) (dispatchErrs []error, middlewareErrs []error) {
 	var run func(int)
 	run = func(i int) {
-		if middlewareErr != nil {
-			return
-		}
 		if i == len(middlewares) {
 			dispatchErrs = dispatch()
 			return
@@ -391,11 +392,11 @@ func runMiddlewares(middlewares []EventMiddleware[any], topic string, event any,
 		middlewareReturned = true
 		nextMu.Unlock()
 		if err != nil {
-			middlewareErr = err
+			middlewareErrs = append(middlewareErrs, err)
 		}
 	}
 	run(0)
-	return dispatchErrs, middlewareErr
+	return dispatchErrs, middlewareErrs
 }
 
 func (bus *EventBus[T]) dispatchCollect(ctx context.Context, topic string, event T, handlers []*eventHandler[T], closeCh <-chan struct{}, logger Logger, debugLog bool, errorHandler ErrorHandler, metrics Metrics) []error {
@@ -580,7 +581,7 @@ func (bus *EventBus[T]) runHandler(ctx context.Context, closeCh <-chan struct{},
 	case err := <-done:
 		return err
 	case <-timeout:
-		return fmt.Errorf("handler timeout after %s", handler.timeout)
+		return fmt.Errorf("%w: handler timeout after %s", context.DeadlineExceeded, handler.timeout)
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-closeCh:
@@ -738,7 +739,11 @@ func (bus *EventBus[T]) removeHandlerMetrics(handler *eventHandler[T]) {
 	}
 }
 
-// WaitAsync waits for all async callbacks to complete
+// WaitAsync waits for accepted asynchronous callbacks to complete.
+//
+// Publishers must be quiescent before WaitAsync is called. It is not a barrier
+// against concurrent Publish calls starting new asynchronous work. Use Close
+// for concurrent shutdown.
 func (bus *EventBus[T]) WaitAsync() {
 	bus.wg.Wait()
 }
@@ -764,7 +769,7 @@ func (bus *EventBus[T]) SetDeadEventHandler(handler DeadEventHandler[T]) {
 }
 
 // AddMiddleware adds middleware to the bus
-func (bus *EventBus[T]) AddMiddleware(middleware EventMiddleware[any]) {
+func (bus *EventBus[T]) AddMiddleware(middleware EventMiddleware[T]) {
 	if middleware == nil {
 		return
 	}
@@ -801,7 +806,9 @@ func (bus *EventBus[T]) GetTopics() []string {
 	return topics
 }
 
-// GetSubscriberCount returns the number of subscribers for a topic
+// GetSubscriberCount returns the number of subscribers registered under the
+// exact key. For a pattern key such as "orders.*", it counts that pattern's
+// subscribers; it does not count patterns that match a concrete topic.
 func (bus *EventBus[T]) GetSubscriberCount(topic string) int {
 	bus.lock.RLock()
 	defer bus.lock.RUnlock()
@@ -812,7 +819,9 @@ func (bus *EventBus[T]) GetSubscriberCount(topic string) int {
 	return 0
 }
 
-// Close gracefully shuts down the event bus
+// Close gracefully shuts down the event bus. It must be called by the bus
+// owner, not from an asynchronous handler running on this bus, because Close
+// waits for accepted asynchronous work.
 func (bus *EventBus[T]) Close() error {
 	bus.lock.Lock()
 

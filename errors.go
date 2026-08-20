@@ -16,4 +16,7 @@ var (
 	// than returned by Publish because asynchronous delivery has already
 	// detached from the publisher.
 	ErrAsyncQueueFull = errors.New("asynchronous handler queue is full")
+	// ErrInvalidHandlerOptions reports a combination of subscription options
+	// that cannot affect the configured handler.
+	ErrInvalidHandlerOptions = errors.New("invalid handler options")
 )

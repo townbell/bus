@@ -1,6 +1,8 @@
 package prometheus
 
 import (
+	"errors"
+	"fmt"
 	"time"
 
 	client "github.com/prometheus/client_golang/prometheus"
@@ -36,7 +38,7 @@ var _ bus.DetailedMetrics = (*Metrics)(nil)
 var _ bus.HandlerMetricsCleaner = (*Metrics)(nil)
 
 // New creates a Prometheus-backed metrics collector.
-func New(config Config) *Metrics {
+func New(config Config) (*Metrics, error) {
 	if config.Namespace == "" {
 		config.Namespace = "go_bus"
 	}
@@ -120,31 +122,65 @@ func New(config Config) *Metrics {
 		Buckets:     config.Buckets,
 	}, []string{"topic", "handler", "status"})
 
-	m.publishedTotal = registerOrReuse[client.Counter](config.Registerer, m.publishedTotal)
-	m.processedTotal = registerOrReuse[client.Counter](config.Registerer, m.processedTotal)
-	m.failedTotal = registerOrReuse[client.Counter](config.Registerer, m.failedTotal)
-	m.subscribers = registerOrReuse[client.Gauge](config.Registerer, m.subscribers)
-	m.publishedTopic = registerOrReuse[*client.CounterVec](config.Registerer, m.publishedTopic)
-	m.processedTopic = registerOrReuse[*client.CounterVec](config.Registerer, m.processedTopic)
-	m.failedTopic = registerOrReuse[*client.CounterVec](config.Registerer, m.failedTopic)
-	m.processedHandle = registerOrReuse[*client.CounterVec](config.Registerer, m.processedHandle)
-	m.failedHandle = registerOrReuse[*client.CounterVec](config.Registerer, m.failedHandle)
-	m.duration = registerOrReuse[*client.HistogramVec](config.Registerer, m.duration)
-	return m
+	var err error
+	if m.publishedTotal, err = registerOrReuse[client.Counter](config.Registerer, m.publishedTotal); err != nil {
+		return nil, err
+	}
+	if m.processedTotal, err = registerOrReuse[client.Counter](config.Registerer, m.processedTotal); err != nil {
+		return nil, err
+	}
+	if m.failedTotal, err = registerOrReuse[client.Counter](config.Registerer, m.failedTotal); err != nil {
+		return nil, err
+	}
+	if m.subscribers, err = registerOrReuse[client.Gauge](config.Registerer, m.subscribers); err != nil {
+		return nil, err
+	}
+	if m.publishedTopic, err = registerOrReuse[*client.CounterVec](config.Registerer, m.publishedTopic); err != nil {
+		return nil, err
+	}
+	if m.processedTopic, err = registerOrReuse[*client.CounterVec](config.Registerer, m.processedTopic); err != nil {
+		return nil, err
+	}
+	if m.failedTopic, err = registerOrReuse[*client.CounterVec](config.Registerer, m.failedTopic); err != nil {
+		return nil, err
+	}
+	if m.processedHandle, err = registerOrReuse[*client.CounterVec](config.Registerer, m.processedHandle); err != nil {
+		return nil, err
+	}
+	if m.failedHandle, err = registerOrReuse[*client.CounterVec](config.Registerer, m.failedHandle); err != nil {
+		return nil, err
+	}
+	if m.duration, err = registerOrReuse[*client.HistogramVec](config.Registerer, m.duration); err != nil {
+		return nil, err
+	}
+	return m, nil
 }
 
-func registerOrReuse[T client.Collector](registerer client.Registerer, collector T) T {
-	if err := registerer.Register(collector); err != nil {
-		if alreadyRegistered, ok := err.(client.AlreadyRegisteredError); ok {
-			existing, ok := alreadyRegistered.ExistingCollector.(T)
-			if !ok {
-				panic("prometheus collector already registered with incompatible type")
-			}
-			return existing
-		}
+// MustNew is New for callers that treat invalid metric registration as a
+// process-startup failure.
+func MustNew(config Config) *Metrics {
+	metrics, err := New(config)
+	if err != nil {
 		panic(err)
 	}
-	return collector
+	return metrics
+}
+
+func registerOrReuse[T client.Collector](registerer client.Registerer, collector T) (T, error) {
+	if err := registerer.Register(collector); err != nil {
+		var alreadyRegistered client.AlreadyRegisteredError
+		if errors.As(err, &alreadyRegistered) {
+			existing, ok := alreadyRegistered.ExistingCollector.(T)
+			if !ok {
+				var zero T
+				return zero, fmt.Errorf("prometheus collector already registered with incompatible type: %w", err)
+			}
+			return existing, nil
+		}
+		var zero T
+		return zero, fmt.Errorf("register prometheus collector: %w", err)
+	}
+	return collector, nil
 }
 
 func (m *Metrics) IncrementPublished() {

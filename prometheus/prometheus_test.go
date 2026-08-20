@@ -2,6 +2,7 @@ package prometheus
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	client "github.com/prometheus/client_golang/prometheus"
@@ -11,7 +12,7 @@ import (
 
 func TestMetricsImplementsBusMetrics(t *testing.T) {
 	registry := client.NewRegistry()
-	metrics := New(Config{
+	metrics := MustNew(Config{
 		Namespace:  "test",
 		Subsystem:  "bus",
 		Registerer: registry,
@@ -44,12 +45,12 @@ func TestMetricsImplementsBusMetrics(t *testing.T) {
 
 func TestMetricsReusesAlreadyRegisteredCollectors(t *testing.T) {
 	registry := client.NewRegistry()
-	_ = New(Config{
+	_ = MustNew(Config{
 		Namespace:  "test",
 		Subsystem:  "reuse",
 		Registerer: registry,
 	})
-	second := New(Config{
+	second := MustNew(Config{
 		Namespace:  "test",
 		Subsystem:  "reuse",
 		Registerer: registry,
@@ -67,7 +68,7 @@ func TestMetricsReusesAlreadyRegisteredCollectors(t *testing.T) {
 
 func TestMetricsRemovesHandlerSeriesOnUnsubscribe(t *testing.T) {
 	registry := client.NewRegistry()
-	metrics := New(Config{Namespace: "test", Subsystem: "cleanup", Registerer: registry})
+	metrics := MustNew(Config{Namespace: "test", Subsystem: "cleanup", Registerer: registry})
 	eventBus := bus.NewTyped[string](bus.WithMetrics[string](metrics))
 	defer eventBus.Close()
 
@@ -93,8 +94,8 @@ func TestMetricsRemovesHandlerSeriesOnUnsubscribe(t *testing.T) {
 
 func TestMetricsKeepsOtherBusHandlerSeriesOnUnsubscribe(t *testing.T) {
 	registry := client.NewRegistry()
-	first := New(Config{Namespace: "test", Subsystem: "shared", Registerer: registry})
-	second := New(Config{Namespace: "test", Subsystem: "shared", Registerer: registry})
+	first := MustNew(Config{Namespace: "test", Subsystem: "shared", Registerer: registry})
+	second := MustNew(Config{Namespace: "test", Subsystem: "shared", Registerer: registry})
 	firstBus := bus.NewTyped[string](bus.WithMetrics[string](first))
 	secondBus := bus.NewTyped[string](bus.WithMetrics[string](second))
 	defer firstBus.Close()
@@ -126,7 +127,7 @@ func TestMetricsKeepsOtherBusHandlerSeriesOnUnsubscribe(t *testing.T) {
 
 func TestMetricsRemovesHandlerSeriesAfterOnceAndClose(t *testing.T) {
 	registry := client.NewRegistry()
-	metrics := New(Config{Namespace: "test", Subsystem: "once_close", Registerer: registry})
+	metrics := MustNew(Config{Namespace: "test", Subsystem: "once_close", Registerer: registry})
 	eventBus := bus.NewTyped[string](bus.WithMetrics[string](metrics))
 
 	if _, err := eventBus.Subscribe("once", func(context.Context, string) error { return nil }, bus.HandlerOnce()); err != nil {
@@ -153,5 +154,21 @@ func TestMetricsRemovesHandlerSeriesAfterOnceAndClose(t *testing.T) {
 	}
 	if count := testutil.CollectAndCount(metrics.processedHandle); count != 0 {
 		t.Fatalf("Expected no handler series after Close, got %d", count)
+	}
+}
+
+type failingRegisterer struct {
+	err error
+}
+
+func (r failingRegisterer) Register(client.Collector) error { return r.err }
+func (failingRegisterer) MustRegister(...client.Collector)  {}
+func (failingRegisterer) Unregister(client.Collector) bool  { return false }
+
+func TestNewReturnsRegistrationError(t *testing.T) {
+	want := errors.New("registration failed")
+	metrics, err := New(Config{Registerer: failingRegisterer{err: want}})
+	if metrics != nil || !errors.Is(err, want) {
+		t.Fatalf("Expected registration error, got metrics=%v err=%v", metrics, err)
 	}
 }

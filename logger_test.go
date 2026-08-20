@@ -18,6 +18,14 @@ type TestLogger struct {
 	mu     sync.Mutex
 }
 
+type minimalLogger struct{}
+
+func (minimalLogger) Debug(string, ...interface{}) {}
+func (minimalLogger) Error(string, ...interface{}) {}
+func (minimalLogger) GetLevel() LogLevel           { return LogLevelError }
+
+var _ Logger = minimalLogger{}
+
 func NewTestLogger() *TestLogger {
 	return &TestLogger{
 		buffer: &bytes.Buffer{},

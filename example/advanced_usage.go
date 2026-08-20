@@ -31,7 +31,7 @@ func main() {
 	})
 
 	// Add middleware - logging
-	eventBus.AddMiddleware(func(topic string, event interface{}, next func()) error {
+	eventBus.AddMiddleware(func(topic string, event UserEvent, next func()) error {
 		log.Printf("Publishing event to topic '%s': %+v", topic, event)
 		start := time.Now()
 		next()
@@ -71,7 +71,7 @@ func main() {
 	eventBus.WaitAsync()
 }
 
-func basicExample(eventBus bus.Bus[UserEvent]) {
+func basicExample(eventBus *bus.EventBus[UserEvent]) {
 	// Subscribe to user events
 	handle, err := eventBus.Subscribe("user.login", func(ctx context.Context, event UserEvent) error {
 		fmt.Printf("User login: %s at %s\n", event.UserID, event.Timestamp.Format("15:04:05"))
@@ -91,7 +91,7 @@ func basicExample(eventBus bus.Bus[UserEvent]) {
 	})
 }
 
-func priorityExample(eventBus bus.Bus[UserEvent]) {
+func priorityExample(eventBus *bus.EventBus[UserEvent]) {
 	// High priority handler - security check
 	securityHandle, _ := eventBus.Subscribe("user.action", func(ctx context.Context, event UserEvent) error {
 		fmt.Printf("🔒 Security check: User %s performing %s\n", event.UserID, event.Action)
@@ -124,7 +124,7 @@ func priorityExample(eventBus bus.Bus[UserEvent]) {
 	})
 }
 
-func filterExample(eventBus bus.Bus[UserEvent]) {
+func filterExample(eventBus *bus.EventBus[UserEvent]) {
 	// Only process admin user events
 	adminHandle, _ := eventBus.Subscribe("user.action", func(ctx context.Context, event UserEvent) error {
 		fmt.Printf("👑 Admin action: %s performed %s\n", event.UserID, event.Action)
@@ -166,7 +166,7 @@ func filterExample(eventBus bus.Bus[UserEvent]) {
 	}
 }
 
-func contextExample(eventBus bus.Bus[UserEvent]) {
+func contextExample(eventBus *bus.EventBus[UserEvent]) {
 	// Create a cancellable context
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -199,7 +199,7 @@ func contextExample(eventBus bus.Bus[UserEvent]) {
 	})
 }
 
-func metricsExample(eventBus bus.Bus[UserEvent]) {
+func metricsExample(eventBus *bus.EventBus[UserEvent]) {
 	// Subscribe multiple handlers
 	handle1, _ := eventBus.Subscribe("metrics.test", func(ctx context.Context, event UserEvent) error {
 		fmt.Printf("Handler 1 processing: %s\n", event.UserID)
@@ -241,7 +241,7 @@ func metricsExample(eventBus bus.Bus[UserEvent]) {
 	fmt.Printf("  - metrics.test subscriber count: %d\n", eventBus.GetSubscriberCount("metrics.test"))
 }
 
-func errorHandlingExample(eventBus bus.Bus[UserEvent]) {
+func errorHandlingExample(eventBus *bus.EventBus[UserEvent]) {
 	// A handler can now report a business failure by returning an error; the
 	// publish call returns the joined failures of the synchronous handlers.
 	errorHandle, _ := eventBus.Subscribe("user.error", func(ctx context.Context, event UserEvent) error {
@@ -279,7 +279,7 @@ func errorHandlingExample(eventBus bus.Bus[UserEvent]) {
 	fmt.Printf("Failed events count: %d\n", failed)
 }
 
-func timeoutExample(eventBus bus.Bus[UserEvent]) {
+func timeoutExample(eventBus *bus.EventBus[UserEvent]) {
 	// Subscribe a slow handler with a per-handler timeout. The handler's
 	// context is canceled when the timeout elapses, so it can stop early.
 	handle, _ := eventBus.Subscribe("user.slow", func(ctx context.Context, event UserEvent) error {
